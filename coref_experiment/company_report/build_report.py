@@ -231,6 +231,93 @@ def load_formd(db_path: Path, cik: str, spv_key: str) -> dict:
             "spvs": spvs, "db_until": db_until, "year_of_inc": int(years_inc[0]) if years_inc else None}
 
 
+def previous_names(dirs: list[str], cik: str) -> list[str]:
+    """The company's former names as its own Form D notices give them (issuerPreviousNameList / edgarPreviousNameList of the
+    primary issuer, 'None' left out); the Form D database does not keep them."""
+    names: dict = {}
+    for p in sorted(x for d in dirs for x in Path(d).glob("*primary_doc.xml")):
+        t = p.read_text(encoding="utf-8", errors="ignore")
+        iss = re.search(r"<primaryIssuer>(.*?)</primaryIssuer>", t, re.S)
+        if not iss or not re.search(rf"<cik>\s*0*{int(cik)}\s*</cik>", iss[1]):
+            continue
+        for lst in re.findall(r"<(?:issuer|edgar)PreviousNameList>(.*?)</(?:issuer|edgar)PreviousNameList>", iss[1], re.S):
+            for n in re.findall(r"<(?:previousName|value)>\s*(.*?)\s*</", lst, re.S):
+                if n and n.lower() not in ("none", "n/a"):
+                    names.setdefault(html.unescape(n).lower(), html.unescape(n))
+    return list(names.values())
+
+
+# one person under several spellings: a nickname (common English short forms), an initial, a nickname quoted in the legal name
+NICKNAMES = {"bill": "william", "will": "william", "billy": "william", "bob": "robert", "rob": "robert", "bobby": "robert", "jim": "james",
+             "jimmy": "james", "mike": "michael", "dave": "david", "dan": "daniel", "danny": "daniel", "tom": "thomas", "joe": "joseph",
+             "steve": "stephen", "chris": "christopher", "nick": "nicholas", "tony": "anthony", "andy": "andrew", "drew": "andrew",
+             "ben": "benjamin", "sam": "samuel", "matt": "matthew", "pat": "patrick", "rick": "richard", "dick": "richard", "rich": "richard",
+             "ted": "edward", "ed": "edward", "ken": "kenneth", "larry": "lawrence", "jack": "john", "johnny": "john", "jon": "jonathan",
+             "liz": "elizabeth", "beth": "elizabeth", "kate": "katherine", "kathy": "katherine", "jen": "jennifer", "jenny": "jennifer",
+             "sue": "susan", "meg": "margaret", "peggy": "margaret", "greg": "gregory", "jeff": "jeffrey", "alex": "alexander", "fred": "frederick",
+             "chuck": "charles", "charlie": "charles", "hank": "henry", "harry": "henry", "jerry": "gerald", "ron": "ronald", "don": "donald",
+             "doug": "douglas", "tim": "timothy", "phil": "philip", "pete": "peter", "ray": "raymond", "walt": "walter", "frank": "francis",
+             "nate": "nathan", "zach": "zachary", "josh": "joshua", "vince": "vincent", "stan": "stanley", "al": "albert", "gabe": "gabriel"}
+TITLES = re.compile(r"\b(?:dr|mr|mrs|ms|prof)\b\.?|,?\s*\b(?:jr|sr|ii|iii|iv|ph\.?\s?d|m\.?d|esq|cpa|mba)\b\.?", re.I)
+QUOTED = re.compile(r"[“\"‘]([A-Za-z]+)[”\"’]")
+NICK_IN_NAME = re.compile(r"\b([A-Z][a-z]+)(?:\s+[A-Z][a-z]*\.?)*\s+[“\"‘]([A-Z][a-z]+)[”\"’]\s+([A-Z][a-z]+)")   # John Ellis “Jeb” Bush
+PERSON_HEAD = re.compile(r"^((?:(?:Dr|Mr|Mrs|Ms)\.?\s+)?[A-Z][\w.’'-]*(?:\s+(?:[A-Z][\w.’'-]*|[“\"][A-Z]\w*[”\"]))+"
+                         r"(?:,\s*(?:Ph\.?\s?D|M\.?D|Jr|Sr|III|II|IV)\.?)?)\s+(?:is|was|has|had|serves|served|will|joined|became|holds|held)\b")
+
+
+def person_parts(name: str) -> tuple:
+    """(last name, given names, quoted nickname) in lower case, titles and degrees left out ('Paul E. Jacobs, PhD' -> jacobs, [paul, e])."""
+    nick = QUOTED.search(name or "")
+    w = [x.strip(".").lower() for x in re.findall(r"[A-Za-z][A-Za-z.'-]*", TITLES.sub(" ", QUOTED.sub(" ", name or "")))]
+    w = [x for x in w if x]
+    return (w[-1], w[:-1], nick[1].lower() if nick else "") if w else ("", [], "")
+
+
+def same_person(a: str, b: str, aliases: dict) -> bool:
+    """Same last name, and first names that are equal, one a known nickname or the initial of the other, or a nickname quoted in a
+    legal name of this report (aliases: last name -> {first name, nickname} pairs)."""
+    (la, ga, na), (lb, gb, nb) = person_parts(a), person_parts(b)
+    if not la or la != lb or not ga or not gb:
+        return False
+    fa, fb = ga[0], gb[0]
+    if ({fa, NICKNAMES.get(fa, fa), na} - {""}) & ({fb, NICKNAMES.get(fb, fb), nb} - {""}):
+        return True
+    if (len(fa) == 1 and fb.startswith(fa)) or (len(fb) == 1 and fa.startswith(fb)):
+        return True
+    return any({fa, fb} <= x or {NICKNAMES.get(fa, fa), NICKNAMES.get(fb, fb)} <= x for x in aliases.get(la, ()))
+
+
+def merge_people(fd: dict, facts: list[dict], texts: list[str]) -> None:
+    """One person per row within this report: Form D people of one person are one row listing every spelling (names), and each
+    person_role fact names its person (fact "person": the Form D name, else the first spelling of the facts), its spelling added to
+    the Form D row ('John Bush' on Form D = 'Jeb Bush' = 'John Ellis “Jeb” Bush'; 'Paul Jacobs' = 'Paul E. Jacobs, PhD')."""
+    aliases: dict = collections.defaultdict(list)
+    for t in texts:
+        for m in NICK_IN_NAME.finditer(t or ""):
+            aliases[m[3].lower()].append({m[1].lower(), NICKNAMES.get(m[1].lower(), m[1].lower()), m[2].lower()})
+    people: list = []
+    for p in fd["people"]:
+        q = next((q for q in people if same_person(q["name"], p["name"], aliases)), None)
+        if q is None:
+            people.append({**p, "names": collections.Counter(p["names"])})
+            continue
+        q["roles"] |= p["roles"]
+        q["first"], q["last"], q["n"] = min(q["first"], p["first"]), max(q["last"], p["last"]), q["n"] + p["n"]
+        q["names"].update(p["names"])
+        q["name"] = q["names"].most_common(1)[0][0]
+    fd["people"] = people
+    seen: list = []
+    for f in facts:
+        m = PERSON_HEAD.match(f.get("value_text") or "") if f["metric"] == "person_role" else None
+        if not m:
+            continue
+        p = next((p for p in people if same_person(p["name"], m[1], aliases)), None)
+        if p:
+            p["names"][m[1]] += 0                      # a spelling of other filings: listed, not counted as a Form D filing
+        f["person"] = p["name"] if p else next((n for n in seen if same_person(n, m[1], aliases)), m[1])
+        seen.append(f["person"])
+
+
 # ---------------------------------------------------------------------------------------------- 2. filings
 def prepared_filings(company: str, prepare: bool, extra: list[str] | None = None, only: set | None = None) -> list[dict]:
     """Filings of one dump folder plus any extra folders (a form set downloaded separately, e.g. databricks_ncsr). Results
@@ -343,8 +430,11 @@ restricted securities, holdings list, transactions with portfolio companies). Fi
 
 facts: every other fact about TARGET (or its subsidiaries). One row per fact:
   para_no; metric (one of: {metrics}); value_number (number or null); unit (one of: {units});
-  as_of_date (the date the fact refers to: the event or ruling date for a legal_event, the period end for a volume or
-  revenue figure; YYYY-MM-DD, or YYYY-MM / YYYY when only that is given; "" if no date is stated);
+  as_of_date (the date the fact itself applies to: the event or ruling date for a legal_event, the period end for a volume or
+  revenue figure, the date the text gives for a person's role; YYYY-MM-DD, or YYYY-MM / YYYY when only that is given. Take it
+  only from the words that state this fact: never a nearby date of the paragraph or its [ctx] lines that belongs to something
+  else (a share-count or record date, a trust-account date, a rent-roll date), and never a lease expiry, maturity or option
+  date unless the fact is that expiry or option. "" when no date is stated for the fact or it is unclear which date applies);
   value_text (one plain-English sentence, max 30 words, stating the fact with its date);
   evidence; confidence.
   legal_event = each lawsuit, ruling, injunction, appeal or regulator action involving TARGET, as a separate row.
@@ -856,6 +946,12 @@ def position_row(g: list[dict], review: list[dict]) -> dict:
         for f in ("shares", "cost_usd", "fair_value_usd", "commitment_usd", "acquisition_date", "as_of_date", "pct_net_assets"):
             if e.get(f) in (None, "") and h.get(f) not in (None, ""):
                 e[f] = h[f]
+    if e.get("shares") in (None, "") and e.get("position_type") not in LOANS:   # the used rows print no share count: a review row of the same
+        r = next((h for h in review if h.get("shares") and (h.get("as_of_date") or "") == (e.get("as_of_date") or "")   # holder, date and value does
+                  and near(h.get("fair_value_usd"), e.get("fair_value_usd"), max(float(h.get("value_scale") or 1), float(e.get("value_scale") or 1)))), None)
+        if r:
+            e["shares"], e["shares_scale"] = r["shares"], r.get("shares_scale") or 1
+            e["source"] = (e.get("source") or "") + f"; shares from the tier {r.get('evidence_tier') or '?'} row of the same position ({r.get('form')} {r.get('filing_date')})"
     tail = re.search(r"\s+([*†‡]?\d{1,2}(?:\s*,\s*[*†‡]?\d{1,2})*|[*†‡]+(?:\s*,\s*\d{1,2})*)$", e.get("security") or "")
     if tail and not re.search(r"\b(?:series|class|tranche|lot|notes?|fund)$", e["security"][:tail.start()], re.I):
         e["security"] = e["security"][:tail.start()]   # footnote marks after the name ('preferred shares 2,4,5')
@@ -1099,8 +1195,8 @@ def pair_rows(rows: list[dict]) -> list[dict]:
     it. A cost row left over beside value rows of the same security is kept for review (tier C), never counted as a second position."""
     rows = sorted(rows, key=lambda r: r["ord"])
     val = [r for r in rows if r["value"] is not None or r["commitment"] is not None]
-    cost = [r for r in rows if r["value"] is None and r["commitment"] is None]
-    out = list(val)
+    cost = [r for r in rows if r["value"] is None and r["commitment"] is None and r["cost"] is not None]
+    out = list(val) + [r for r in rows if r not in val and r not in cost]   # shares only: nothing to pair
     fits = lambda v, c: ((v["cost"] is None or same_amount(v["cost"], c["cost"])) and                                  # noqa: E731
                          not (v["shares"] and c["shares"] and not same_amount(v["shares"], c["shares"])))
     for key in dict.fromkeys(sec_key(r["name"]) for r in cost):
@@ -1160,8 +1256,8 @@ def load_evidence(path: Path) -> dict | None:
         if x["acq"] and ((x["file_date"] and x["acq"] > x["file_date"]) or r.get("method") == "iXBRL tag" or x["acq"] in (x["as_of"], ev_date(r.get("as_of")))):
             x["acq"] = ""                              # an iXBRL context date or the report date is the date of the table, not of the purchase
         k = (x["accession"], tab, row, x["name"])
-        if k in seen or not any(x[c] is not None for c in ("cost", "value", "commitment")):
-            continue
+        if k in seen or not any(x[c] is not None for c in ("shares", "cost", "value", "commitment")):
+            continue                                   # a share count with no amount is a position too (shares only, in no value figure)
         seen.add(k)
         by[x["accession"]].append(x)
     return {acc: pair_rows(v) for acc, v in by.items()}
@@ -1248,6 +1344,19 @@ def fix_lender_direction(rels: list[dict], target: str) -> int:
     return n
 
 
+def drop_unclear_flips(rels: list[dict]) -> int:
+    """The direction check flips an edge when the model's role and the actor it names disagree. Only a lending relation is flipped
+    that way (a lender is the actor of a loan); for any other role the disagreement means the text does not say who does what (a tenant
+    of a mortgaged property is neither supplier nor customer of the trust): the row is kept in relationships_all.csv, out of the edges."""
+    n = 0
+    for r in rels:
+        m = re.match(r"flipped: role '(\w+)'", r.get("direction_check") or "")
+        if m and m[1] not in ("lender", "borrower"):
+            r["direction_check"] = f"unclear, not used: {r['direction_check']} (only a lending relation is flipped)"
+            n += 1
+    return n
+
+
 def acc_of(m: dict) -> str:
     """The accession of a filing document: an accession can hold several documents (6-K exhibits, N-CSR parts)."""
     return m.get("accession") or (ACC.search(m["stem"]) or [m["stem"]])[0]
@@ -1304,6 +1413,7 @@ def merge(filings: list[dict], per_filing: dict, evidence: dict | None = None, t
                 key = (f["metric"], f.get("as_of_date") or "", f.get("value_number"), d.norm(f.get("value_text", ""))[:60])
                 e = fact.setdefault(key, {**f, "sources": 0})
                 e.update({**f, **src, "sources": e["sources"] + 1})
+    merge.texts = [f"{f.get('value_text') or ''} {f.get('evidence') or ''}" for f in fact.values()]   # every spelling of a name, repeats too
     holdings = sorted(merge_positions(rows, target, nport or []), key=lambda h: (norm_name(h["holder"]), h.get("as_of_date") or "", h["filing_date"]))
     for h in holdings:
         is_debt = h["position_type"] in ("funded_loan", "unfunded_commitment")   # a loan's par amount is not a share count
@@ -1424,7 +1534,7 @@ def rel_edges(rels: list[dict], target: str) -> list[dict]:
     t = norm_name(target)
     edges: dict = {}
     for r in rels:
-        if t not in (norm_name(r["from_company"]), norm_name(r["to_company"])):
+        if t not in (norm_name(r["from_company"]), norm_name(r["to_company"])) or (r.get("direction_check") or "").startswith("unclear"):
             continue
         k = (r["from_company"], r["relation"], r["to_company"])
         e = edges.setdefault(k, {"from": k[0], "relation": k[1], "to": k[2], "rows": 0, "filings": set(), "first": r["filing_date"],
@@ -1588,8 +1698,9 @@ def load_nport(path: str, split) -> list[dict]:
         r["date"] = as_date(r["report_date"])
         r["fund"] = r["series_id"] or r["cik"]
         r["value"] = float(r["value_usd"] or 0)
-        r["filed"] = float(r["filed_price_per_share"]) if r["filed_price_per_share"] else None
-        r["adj_price_per_share"] = round(adjusted(r["filed"], r["date"], split), 4) if r["filed"] else ""
+        sh = float(r.get("shares") or 0)              # value / shares, not the 4-decimal price nport.py writes ($0.0000845 is not $0.0001)
+        r["filed"] = r["value"] / sh if sh and r["position_type"] == "equity" else float(r["filed_price_per_share"]) if r["filed_price_per_share"] else None
+        r["adj_price_per_share"] = adjusted(r["filed"], r["date"], split) if r["filed"] else ""
         r["q"] = f"{r['date'].year} Q{(r['date'].month - 1) // 3 + 1}"
     return rows
 
@@ -1950,13 +2061,15 @@ def build_html(a, fd: dict, filings: list[dict], holdings: list[dict], facts: li
             return "D"
         return "–"
 
+    prev = fd.get("previous_names") or []
+    formerly = f"; formerly {esc(' and '.join(prev) if len(prev) < 3 else ', '.join(prev[:-1]) + ' and ' + prev[-1])}, as its Form D notices state" if prev else ""
     H: list[str] = []
     w = H.append
     # ---------------- cover
     w(f"""<div class="cover"><div class="kicker">P U B L I C &nbsp; R E C O R D &nbsp; R E S E A R C H</div><br><br>
 <div class="muted">FINANCIAL MODEL · UPDATED {today.strftime('%m/%d/%Y')}</div>
 <h1>{esc(short)}: financials year by year, {first_year}-{fyears[-1]}</h1><br>
-<h3>SCOPE</h3><p>Funding, ownership, valuation marks, relationships and legal record of {esc(name)} (SEC CIK {esc(co['cik'])}) for
+<h3>SCOPE</h3><p>Funding, ownership, valuation marks, relationships and legal record of {esc(name)} (SEC CIK {esc(co['cik'])}{formerly}) for
 every year from incorporation in {first_year} to {last_hist}, plus the frame for {fyears[0]}-{fyears[-1]} forecasts. Built from the SEC
 Form D database ({len(fd['filings'])} Form D filings by the company, {len(fd['spvs'])} SPVs) and {n_acc(others)} SEC filings by other companies and
 funds that name {esc(short)}{", plus Department of Labor Form 5500 benefit-plan filings" if plans else ""}. {"Revenue, staff, cost, credit and forecast figures are model estimates built from these records and labelled as such; figures that remain unknown" if fm else "Revenue, " + ("global " if plans else "") + "headcount, cost and forecast figures are not in these sources: they"} are shown as placeholders
@@ -1978,8 +2091,10 @@ language model (GPT-4.1); every row keeps a verbatim quote that was checked agai
     n_sold = sum(float(o["total_amount_sold"] or 0) > 0 for o in offs)   # an option-plan or $0-sold notice raised nothing
     n_none = len(offs) - n_sold
     no_sale = f" (plus {n_none} option-plan or no-sale notice{'s' if n_none > 1 else ''})" if n_none else ""
-    w(f"""<h2>{esc(short)} raised {money(total_raised)} in {n_sold} Form D offerings, {first_year}-{last_hist}</h2>
-<p><b>TL;DR:</b> {esc(name)}, incorporated in {esc(co['jurisdiction_of_inc'] or '').title()} in {first_year} and based in
+    sold_years = sorted(sale_year(o) for o in offs if float(o["total_amount_sold"] or 0) > 0)   # first to last sale, not to the latest filing
+    span = (f"{sold_years[0]}-{sold_years[-1]}" if sold_years[0] != sold_years[-1] else f"in {sold_years[0]}") if sold_years else "no sale reported"
+    w(f"""<h2>{esc(short)} raised {money(total_raised)} in {n_sold} Form D offerings, {span}</h2>
+<p><b>TL;DR:</b> {esc(name)}{" (" + formerly[2:] + ")" if prev else ""}, incorporated in {esc(co['jurisdiction_of_inc'] or '').title()} in {first_year} and based in
 {esc((co['city'] or '').title())}, {esc(co['state'] or '')}, has filed {len(fd['filings'])} Form D notices. They report
 {money(total_raised)} of {'equity and debt' if any_debt else 'equity'} sold in {n_sold} offerings{no_sale}, with {int(co['total_investors'] or 0)} investor participations
 (each notice's investor count added up: an investor in several rounds is counted once per round),
@@ -2187,7 +2302,9 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
         w(f"<p class='note'>No Form D with a first sale in {', '.join(map(str, gap))} {P('R11')}.</p>")
     w('<h3>Officers and directors named on Form D</h3><table><tr><th>Person</th><th>Role</th><th>First named</th><th>Last named</th><th class="n">Filings</th></tr>')
     for p in fd["people"]:
-        w(f"<tr><td>{esc(p['name'])}</td><td>{esc(', '.join(sorted(p['roles'])))}</td><td>{fmt_date(p['first'])}</td>"
+        also = "; ".join(n for n in p["names"] if n != p["name"])   # other spellings: on Form D or in other filings
+        also = f" <span class='muted'>(also named {esc(also)})</span>" if also else ""
+        w(f"<tr><td>{esc(p['name'])}{also}</td><td>{esc(', '.join(sorted(p['roles'])))}</td><td>{fmt_date(p['first'])}</td>"
           f"<td>{fmt_date(p['last'])}</td><td class='n'>{p['n']}</td></tr>")
     w("</table>")
     if fd["spvs"]:
@@ -2284,9 +2401,12 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
         w("<p class='note'>No relationship rows (run without --no-llm).</p>")
     roles = [f for f in facts if f["metric"] in ("person_role", "investor_link")]
     if roles:
-        w('<h3>People and investors named in other filings</h3><table><tr><th>Statement</th><th>Source</th></tr>')
-        for f in roles:
-            w(f"<tr><td>{esc(f['value_text'])}</td><td>{esc(f['form'])} · {esc(f['filer'])} · {fmt_date(f['filing_date'])}</td></tr>")
+        w('<h3>People and investors named in other filings</h3><p class="note">One person under several spellings (nickname, initial, '
+          'degree) is one person: the Person column gives the name of the Form D table when the person is on it.</p>'
+          '<table><tr><th>Person</th><th>Statement</th><th>Source</th></tr>')
+        order = list(dict.fromkeys(f.get("person") or "" for f in roles))
+        for f in sorted(roles, key=lambda f: (order.index(f.get("person") or ""), f["metric"])):
+            w(f"<tr><td>{esc(f.get('person') or '')}</td><td>{esc(f['value_text'])}</td><td>{esc(f['form'])} · {esc(f['filer'])} · {fmt_date(f['filing_date'])}</td></tr>")
         w("</table>")
     legal = [f for f in facts if f["metric"] in ("legal_event", "regulatory_status")]
     if legal:
@@ -2402,6 +2522,7 @@ def main() -> int:
     ap.add_argument("--evidence-rows", default="", help="table rows read by rule (evidence_build.py); default out/<company>/evidence/evidence_rows.csv. "
                     "Holdings numbers come from these rows; without the file they stay as the model read them")
     ap.add_argument("--evidence-tiers", default="A,B", help="evidence tiers whose numbers are used; rows of other tiers are only flagged")
+    ap.add_argument("--formd-xml-dir", action="append", default=[], help="folder of the company's Form D notices (*primary_doc.xml): former names")
     a = ap.parse_args()
     cik = a.cik.zfill(10)
     out = Path(a.out_dir) if a.out_dir else HERE / "out" / a.company
@@ -2418,8 +2539,9 @@ def main() -> int:
     a.short = short_name(name, a.cfg)
     spv_key = a.spv_key or (a.cfg.get("company") or {}).get("spv_key") or norm_name(name).split()[0]
     fd = load_formd(Path(a.formd_db), cik, spv_key)
+    fd["previous_names"] = previous_names(a.formd_xml_dir, cik)
     print(f"   {name}: {len(fd['filings'])} filings, {len(fd['offerings'])} offerings, {money(fd['company']['total_raised'])} sold, "
-          f"{len(fd['people'])} people, {len(fd['spvs'])} SPVs ('{spv_key}')")
+          f"{len(fd['people'])} people, {len(fd['spvs'])} SPVs ('{spv_key}'), former names: {'; '.join(fd['previous_names']) or 'none given'}")
 
     print("2. Filings that mention the company (prepared pipeline output)")
     only = set(Path(a.only_stems).read_text().split()) if a.only_stems else None
@@ -2429,6 +2551,7 @@ def main() -> int:
     print("3. Relationships (steps/relationships.py, with the direction check)")
     rels = run_relationships(filings, out, a.model, a.rerun_relationships, a.no_llm)
     print(f"   {fix_lender_direction(rels, name)} lends_to rows corrected (borrower in a loan schedule)")
+    print(f"   {drop_unclear_flips(rels)} rows of a non-lending role whose actor disagreed left out of the edges (direction unclear)")
     edges = rel_edges(rels, name)
 
     print("4. Facts (holdings, dated facts)")
@@ -2446,6 +2569,7 @@ def main() -> int:
     a.nport = load_nport(a.nport_csv, parse_split(a.split)) if a.nport_csv else []   # holder names follow the N-PORT series of the same fund
     holdings, facts = merge(filings, per_filing, a.evidence, a.tiers, name, add_unread=only is None, nport=a.nport)
     a.unread = merge.unread
+    merge_people(fd, facts, merge.texts)
     print(f"   {mark_restated_costs(holdings, name)} restated cost basis rows (not purchases); holders: "
           f"{dict(collections.Counter(h.get('holder_basis') or '' for h in holdings))}")
     if a.unread[0]:
@@ -2484,7 +2608,7 @@ def main() -> int:
     if a.nport:
         write_csv(out / "nport_holdings.csv", a.nport, [k for k in a.nport[0] if k not in ("date", "value", "filed", "q", "fund")])
     write_csv(out / "facts.csv", facts, ["as_of_date", "metric", "value_number", "unit", "value_text", "form", "filer", "filing_date",
-                                          "sources", "page", "evidence", "confidence", "sec_url"])
+                                          "sources", "page", "evidence", "confidence", "sec_url", "person"])
     write_csv(out / "relationships_all.csv", rels, ["form", "filing_date", "filer", "page", "from_company", "relation", "to_company",
                                                     "role_sentence", "direction_check", "confidence", "evidence_quote", "sec_url"])
     write_csv(out / "requirements.csv", [{"id": r, "missing_value": REQUIREMENTS[r][0], "required_form": REQUIREMENTS[r][1],

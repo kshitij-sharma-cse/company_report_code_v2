@@ -84,8 +84,10 @@ ROLE_HELP = {
 ROLES = list(ROLE_EDGE) + ["related_unclear", "none"]
 
 # Direction check. The model also names the company that DOES the action ("actor"). For a directed role the code
-# knows which of X / Y should be the actor; when the model's role and its actor disagree, the actor wins and the edge is
-# flipped (e.g. role "investor" for X = Acme while the actor is the fund: the fund invests in Acme).
+# knows which of X / Y should be the actor; when the model's role and its actor disagree on a lending relation, the actor
+# wins and the edge is flipped (role "lender" for X = Acme while the actor is the fund: the fund lends to Acme). For any other
+# role the disagreement marks the row "unclear" (a tenant of a mortgaged property is not a supplier of the trust); the report
+# leaves such rows out of its edges.
 ACTOR_HELP = {
     "supplier": "the supplier", "customer": "the supplier", "manufacturer": "the manufacturer",
     "service_provider": "the service provider", "licensor": "the licensor", "licensee": "the licensor",
@@ -272,6 +274,8 @@ def check_direction(role: str, actor: str, x: str, y: str, ids: dict) -> tuple[s
     expected = x if role in ACTOR_IS_X else y
     if who == expected:
         return f, rel, t, "ok"
+    if role not in ("lender", "borrower"):   # only a lending relation is flipped; otherwise the text does not say who does what
+        return f, rel, t, f"unclear: role '{role}' disagreed with actor {who}"
     return t, rel, f, f"flipped: role '{role}' disagreed with actor {who}"
 
 

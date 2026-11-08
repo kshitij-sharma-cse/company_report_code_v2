@@ -23,8 +23,9 @@ MONTH = r"(?:January|February|March|April|May|June|July|August|September|October
 COL = [("commitment", r"unfunded|commitment|undrawn"), ("price", r"\bper\s+(?:share|unit)\b"), ("value", r"\b(fair|market)?\s*values?\b"), ("cost", r"\bcost\b"), ("qty", r"\bshares\b|\bprincipal\b|\bpar\b|\bunits\b|\bquantity\b|\bface\b|\bnumber of\b"), ("date", r"\bdate\b|\bacquired\b"), ("pct", r"%|percent")]
 HEAD_UNIT = re.compile(r"\(?\$?\s*000[’'`]?s?\)?|thousands|millions|\$\s?m\b", re.I)
 PAGE_UNIT = re.compile(r"(?:\bin\s|\$\s|expressed in\s|amounts?\s|value\s|cost\s)[^.<]{0,40}?(thousands|millions|\$\s?000[’'`]?s?)\b", re.I)
-CACHE_V = "layout-v6"     # bump when a reader changes, so cached rows of older code are not reused
+CACHE_V = "layout-v7"     # bump when a reader changes, so cached rows of older code are not reused
 NUMBER = re.compile(r"^\(?\$?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*\)?\s*[*†‡#]*\s*(?:\([a-z0-9]{1,3}\)\s*,?\s*)*[a-z]{0,1}$")
+SHARES_TXT = re.compile(r"(?<![\d,.$])(\d{1,3}(?:,\d{3})+|\d{3,})\s+(?:[A-Za-z][\w.-]*\s+){0,5}?shares?\b", re.I)
 
 
 def text(x: str) -> str:
@@ -477,6 +478,10 @@ def from_table(t: str, m, key: str, ctx: dict):
     elif ctx.get("last") and fit((ctx["last"][0], width(ctx["last"][1]))):      # no dated schedule: the last header read in the file, when it fits this row
         h, src = ctx["last"][0], "earlier table"
     if not h and not any(NUMBER.match(c[2]) and float(NUMBER.match(c[2])[1].replace(",", "")) >= 100 for c in g):
+        if shares_named(g, key):     # a share count in words and no amount (a pledge or ownership schedule): a position with shares only
+            return dict(method="table", name=next((c[2] for c in g if re.search(key, c[2], re.I)), "")[:140], qty=shares_named(g, key), qty_factor=1, cost=None, value=None,
+                        commitment=None, date="", table=a, row=row, header="no column header; share count printed beside the company", unit="shares only, no amount printed",
+                        unit_factor=1, raw=" | ".join(c[2] for c in g)[:300], problem="", fund=(sch[2] if sch else "") or fund_continued(t, a))
         return dict(problem="not a position: no amount in the row", name=g[0][2][:120], raw=" | ".join(c[2] for c in g)[:300], table=a, row=row, header="", unit="", unit_factor=None, method="table", qty=None, cost=None, value=None, date="")
     if not h:
         return dict(problem="no column header found", name=g[0][2][:120], raw=" | ".join(c[2] for c in g)[:300], table=a, row=row, header="", unit="", unit_factor=None, method="table", qty=None, cost=None, value=None, date="")
@@ -534,6 +539,8 @@ def unit_row(r: dict, units: dict, cols: list, t: str, a: int, trs: list, g: lis
         r["unit_factor"], r["unit"] = 1, "dollars, $ printed in the table, no thousands or millions"
     else:
         r["unit_factor"], r["unit"] = 1, "no unit printed; dollars"
+    if r["qty"] is None and shares_named(g, key):      # no share column: the count printed in the security name
+        r["qty"], units["qty"] = shares_named(g, key), (1, "")
     q = units.get("qty")
     label = next((k[4] for k in cols if k[2] == "qty"), "")
     money_qty = bool(re.search(r"principal|\bpar\b|amount|face", label, re.I)) and not re.search(r"shares", label, re.I)   # par is in the table's money unit
@@ -541,6 +548,17 @@ def unit_row(r: dict, units: dict, cols: list, t: str, a: int, trs: list, g: lis
     if r["qty"] is None and r["cost"] is None and r["value"] is None and r["commitment"] is None:
         r["problem"] = "no number under a known column" if any(NUMBER.match(c) and float(NUMBER.match(c)[1].replace(",", "")) >= 100 for c in (x[2] for x in g)) else "not a position: no amount in the row"
     return r
+
+
+def shares_named(g: list, key: str):
+    """A share count printed in words beside the company, not under a column: in the security name ('Acme Corp. (225,367 common shares)',
+    '828,980 shares of Series A Preferred Stock of Acme, Inc.') or in a cell of its own in parentheses ('(225,367 common shares)')."""
+    for c in g:
+        if len(c[2]) <= 160 and (re.search(key, c[2], re.I) or re.fullmatch(r"\(.*\)", c[2])):
+            m = SHARES_TXT.search(c[2])
+            if m:
+                return float(m[1].replace(",", ""))
+    return None
 
 
 def key_in(tr, key):

@@ -163,6 +163,9 @@ if not args.no_evidence:                          # numbers read by rule from th
 company = cfg.get("company", {})
 cmd = [sys.executable, str(HERE / "build_report.py"), co, "--cik", args.cik, "--name", args.name, "--formd-db", args.formd_db, "--model-config", str(cfg_path),
        "--employee-company", company.get("employee_company", ""), "--spv-key", company.get("spv_key", "")]
+for d in (dumps / co / "D", raw / "sec_form_d"):     # the company's own Form D notices: former names (not in the Form D database)
+    if d.is_dir():
+        cmd += ["--formd-xml-dir", str(d)]
 APP = HERE.parent / "coref_verifier"
 
 

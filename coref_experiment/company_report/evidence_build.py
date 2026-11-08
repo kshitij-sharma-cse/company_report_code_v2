@@ -3,7 +3,7 @@
 
     A  tag         read from an iXBRL tag in the filing
     A  N-PORT      value (and shares where printed) equal a Form N-PORT row of the same date
-    B  stated      column header and unit printed, no second source
+    B  stated      column header and unit printed, no second source; or a share count printed with no amount
     C  review      no unit printed and no second source, per-share value out of range, or differs from N-PORT
 The per-share range test needs an N-PORT mark within mark_window_months (model_config, default 3) of the row's date; with no mark that close the row stays B.
 """
@@ -75,6 +75,8 @@ for r in P:
             loan = val and qty and 0.7 <= val / qty <= 1.3      # par and value: a loan, not shares
             if m and not loan and not m / 3 <= val / qty / (ratio if d < day_ else 1) <= m * 3:
                 tier, why = "C review", "per-share value out of range"
+            elif qty and val is None and cost is None and r["commitment_usd"] is None:
+                tier = "B stated"                  # a printed share count and no amount: no money unit to prove
             elif r["unit"].startswith("no unit"):
                 tier, why = "C review", "no unit printed, no second source"
             else:
