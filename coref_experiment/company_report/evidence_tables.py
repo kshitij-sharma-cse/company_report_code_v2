@@ -18,10 +18,12 @@ from pathlib import Path
 
 csv.field_size_limit(10**8)
 HERE = Path(__file__).parent
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 MONTH = r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
 COL = [("commitment", r"unfunded|commitment|undrawn"), ("value", r"\b(fair|market)?\s*value\b"), ("cost", r"\bcost\b"), ("qty", r"\bshares\b|\bprincipal\b|\bpar\b|\bunits\b|\bquantity\b|\bface\b|\bnumber of\b"), ("date", r"\bdate\b|\bacquired\b"), ("pct", r"%|percent")]
 HEAD_UNIT = re.compile(r"\(?\$?\s*000[’'`]?s?\)?|thousands|millions|\$\s?m\b", re.I)
 PAGE_UNIT = re.compile(r"(?:\bin\s|\$\s|expressed in\s|amounts?\s|value\s|cost\s)[^.<]{0,40}?(thousands|millions|\$\s?000[’'`]?s?)\b", re.I)
+CACHE_V = "as_of-v3"      # bump when a reader changes, so cached rows of older code are not reused
 NUMBER = re.compile(r"^\(?\$?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*\)?\s*[*†‡#]*\s*(?:\([a-z0-9]{1,3}\)\s*,?\s*)*[a-z]{0,1}$")
 
 
@@ -79,10 +81,88 @@ def page_unit(t: str, pos: int):
     return (1e6 if "million" in m[1].lower() else 1e3), sl[max(0, m.start() - 20):m.end() + 10]
 
 
-def as_of(t: str, pos: int) -> str:
-    z = text(t[max(0, pos - 90000):pos])
-    m = list(re.finditer(MONTH + r" \d{1,2}, \d{4}", z))
-    return m[-1][0] if m else ""
+SP = r"(?:\s|&nbsp;|&#160;|&#xa0;|<[^>]{0,300}>)+"     # space, or tags, between the words of a heading in raw html
+DATE = r"(?i:" + MONTH + r")\.?\s+\d{1,2}\s*,\s*\d{4}"
+PRE = r"(?:(?:condensed|consolidated|combined|unaudited)"      # words that can open a statement heading
+HEAD_RAW = re.compile(PRE + SP + r")*(?:schedules?|portfolios?|statements?)" + SP + r"of" + SP + r"(?:portfolio" + SP + r")?investments|>\s*investments\b|quarterly" + SP + r"holdings" + SP + r"report", re.I)
+END_RAW = re.compile(PRE + SP + r")*(?:statements?" + SP + r"of" + SP + r"(?:assets" + SP + r"and" + SP + r"liabilities|operations|changes" + SP + r"in" + SP + r"net" + SP + r"assets|cash" + SP + r"flows)|financial" + SP + r"highlights|notes" + SP + r"to" + SP + r"(?:(?:the|unaudited|condensed|consolidated|combined)" + SP + r")*financial" + SP + r"statements)", re.I)
+AT_START = re.compile(r">(?:\s|&nbsp;|&#160;|&#xa0;)*$")     # a heading opens its element; prose and footnotes do not
+GAP = r"(?:\s*(?:\([^()]{0,90}\)|[-–—:,]|\b(?:as of|as at|at|continued|unaudited)\b))*\s*"
+W = r"(?!" + DATE + r")(?-i:[A-Z0-9][\w&'’®™℠.,/-]*)\s+"
+FUND = r"(?:" + W + r"(?:(?:" + W + r"|(?-i:of|and|the|for|in|&|[-–—])\s+)){0,15}?)?"     # a fund name between heading and date: capitalised words, never prose, never a date
+HEAD_TXT = re.compile(r"^(?:(?:condensed|consolidated|combined|unaudited)\s+)*(?:schedules?|portfolios?|statements?)\s+of\s+(?:portfolio\s+)?investments\b" + GAP + FUND + GAP + r"(" + DATE + r")|^investments\b" + GAP + r"(" + DATE + r")|^quarterly\s+holdings\s+report\b[^.\d]{0,160}?(" + DATE + r")", re.I)
+NOT_HEAD = re.compile(r"\s*(?:\([^()]{0,40}\)\s*)?(?:" + DATE + r"|and\s+(?:" + DATE + r"|\d{4}))|\s*,\s*[a-z]")     # after the date: a second date (comparison columns) or prose going on
+FOOTNOTE = re.compile(r"\([a-z0-9]{1,3}\)\s*(?:at|as\s+of|as\s+at)\s+$", re.I)     # '(h) At March 31, 2024, the Fund held ...'
+AS_OF_RAW = re.compile(r">\s*(?:\(unaudited\)\s*)?as" + SP + r"(?:of|at)" + SP + r"(" + MONTH + r"(?:\s|&nbsp;|&#160;)+\d{1,2},(?:\s|&nbsp;|&#160;)*\d{4})(?:\s|&nbsp;|&#160;)*(?:\(unaudited\))?\s*<", re.I)
+NUM_DATE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})\b")
+
+
+def norm_date(s: str) -> str:
+    """'DECEMBER 31,2016' -> 'December 31, 2016'; '' when it is not a real date."""
+    import datetime as dt
+    m = re.search(r"(" + MONTH + r")\.?\s+(\d{1,2})\s*,\s*(\d{4})", re.sub(r"\s+", " ", s), re.I)
+    try:
+        return dt.datetime.strptime(f"{m[1].title()} {m[2]} {m[3]}", "%B %d %Y").strftime("%B ") + f"{int(m[2])}, {m[3]}" if m else ""
+    except ValueError:
+        return ""
+
+
+def period_of(t: str) -> str:
+    """The filing's own period of report: the EDGAR header of a .txt submission, the 'Date of reporting period:' line of an N-CSR/N-Q cover, else the iXBRL dei tag. Empty when not printed."""
+    m = re.search(r"CONFORMED PERIOD OF REPORT:\s*(\d{4})(\d{2})(\d{2})", t[:20000])
+    if m:
+        return norm_date(f"{MONTHS[int(m[2]) - 1]} {int(m[3])}, {m[1]}") if 1 <= int(m[2]) <= 12 else ""
+    c = re.search(r"date\s+of\s+reporting\s+period\s*:?\s*(.{0,80})", text(t[:60000]), re.I)
+    if c:
+        z = re.split(r"\bitem\b", c[1], flags=re.I)[0]      # the span ends at the next item of the form
+        ds = [(x.start(), norm_date(x[0])) for x in re.finditer(DATE, z)] + [(x.start(), num_date(x)) for x in NUM_DATE.finditer(z)]
+        ds = [d for d in sorted(ds) if d[1]]
+        if ds:
+            return ds[-1][1]     # 'October 1, 2023 - March 31, 2024': the period ends on the last date
+    m = re.search(r'name="dei:DocumentPeriodEndDate"[^>]*>', t, re.I)
+    if not m:
+        return ""
+    v = text(t[m.end():m.end() + 800])[:40]      # the tag can hold a nested tag, so read the text after it
+    return iso_long(v) if re.match(r"\d{4}-", v) else norm_date(v)
+
+
+def num_date(m) -> str:
+    """'06/30/2026' -> 'June 30, 2026' (US order); '' when it is not a real date."""
+    mo, d, y = int(m[1]), int(m[2]), int(m[3]) + (2000 if len(m[3]) == 2 else 0)
+    return norm_date(f"{MONTHS[mo - 1]} {d}, {y}") if 1 <= mo <= 12 else ""
+
+
+def schedule_dates(t: str, filed: str = "") -> list:
+    """(position, date, end) of every dated schedule heading: '[Consolidated] Schedule/Portfolio/Statement of Investments <date>', 'Investments <date>',
+    'Quarterly Holdings Report for <fund> <date>', a caption cell 'As of <date>'. A multi-fund filing gives one per fund. A heading must open its element;
+    one dated after the filing, followed by a second date (columns of a comparison), by prose, or led by a footnote marker is not a schedule date.
+    A heading dates rows up to the next statement or notes heading (assets and liabilities, operations, highlights, notes), so notes tables after the last schedule are not given its date."""
+    out = []
+    for m in HEAD_RAW.finditer(t):
+        if m[0][0] != ">" and not AT_START.search(t[max(0, m.start() - 80):m.start()]):
+            continue
+        s = text(t[m.start() + (m[0][0] == ">"):m.start() + 3000])[:320]
+        h = HEAD_TXT.match(s)
+        if h and not NOT_HEAD.match(s[h.end():]) and not FOOTNOTE.search(s[:h.start(h.lastindex)]):
+            out.append((m.start(), norm_date(h[h.lastindex])))
+    ends = [m.start() for m in END_RAW.finditer(t) if m[0][0].isupper() and AT_START.search(t[max(0, m.start() - 80):m.start()])]
+    import bisect
+    out = [(p, d, next((e for e in ends[bisect.bisect_right(ends, p):]), len(t))) for p, d in out]
+    for m in AS_OF_RAW.finditer(t):     # a caption 'As of <date>' dates only its own table, or the table below it
+        e = t.find("</table>", m.start())
+        out.append((m.start(), norm_date(m[1]), e if e >= 0 else m.start() + 20000))
+    import datetime as dt
+    ok = lambda d: d and (not filed or dt.datetime.strptime(d, "%B %d, %Y").date().isoformat() <= filed)
+    return sorted(x for x in out if ok(x[1]))
+
+
+def as_of(heads: list, pos: int, period: str) -> str:
+    """The date of the nearest schedule heading above the row; else the filing's period of report; else empty, never a guess."""
+    import bisect
+    for p, d, end in reversed(heads[:bisect.bisect_right(heads, (pos, "~"))]):
+        if pos <= end:
+            return d
+    return period
 
 
 def from_ixbrl(t: str, key: str) -> list:
@@ -107,8 +187,14 @@ def from_ixbrl(t: str, key: str) -> list:
     for cid, r in rows.items():
         q, cs, v = r.get("InvestmentOwnedBalancePrincipalAmount") or r.get("InvestmentOwnedBalanceShares"), r.get("InvestmentOwnedAtCost"), r.get("InvestmentOwnedAtFairValue")
         if q or cs or v:
-            out.append(dict(method="iXBRL tag", name=r["name"][:120], qty=q, cost=cs, value=v, date=r["date"], header="iXBRL concepts", unit="scale attribute of the tag", unit_factor=1, raw=json.dumps({k: v_ for k, v_ in r.items() if k not in ("name", "date")})[:300], table=cid, row="", problem=""))
+            out.append(dict(method="iXBRL tag", name=r["name"][:120], qty=q, cost=cs, value=v, date=r["date"], as_of=iso_long(r["date"]), header="iXBRL concepts", unit="scale attribute of the tag", unit_factor=1, raw=json.dumps({k: v_ for k, v_ in r.items() if k not in ("name", "date")})[:300], table=cid, row="", problem=""))
     return out
+
+
+def iso_long(d: str) -> str:
+    """'2025-03-31' -> 'March 31, 2025', the form of every other as_of."""
+    i = re.match(r"(\d{4})-(\d{2})-(\d{2})", d or "")
+    return norm_date(f"{MONTHS[int(i[2]) - 1]} {int(i[3])}, {i[1]}") if i and 1 <= int(i[2]) <= 12 else ""
 
 
 def from_table(t: str, m, key: str, last: list):
@@ -197,24 +283,31 @@ def from_text(t: str, m, key: str):
     return dict(method="text layout", name=r[1][:140], qty=float(r[2].replace(",", "")), cost=float(c[1].replace(",", "")) if c else None, value=float(r[3].replace(",", "")), date="", table="text", row=m.start(), header="shares then value, as laid out", unit=u or "no unit printed; dollars", unit_factor=f or 1, raw=x[:300], problem="", qty_factor=1)
 
 
-def from_pdf(p: Path, key: str) -> list:
+def from_pdf(p: Path, key: str, filed: str = "") -> list:
     """PDF lines naming the company. Numbers are read right to left against the nearest printed header line above; a line that does not fit goes to review."""
     import pypdfium2
     doc = pypdfium2.PdfDocument(str(p))
     out = []
     labels = [("date", r"date"), ("qty", r"shares|principal|par\b|units"), ("cost", r"cost"), ("value", r"value")]
+    last = ""      # a schedule runs over pages: a page with no heading keeps the date of the last heading
     for i in range(len(doc)):
         pg = doc[i]
         tp = pg.get_textpage()
         txt = tp.get_text_range()
         tp.close()
         pg.close()
+        lines = [re.sub(r"\s+", " ", x).strip() for x in txt.splitlines()]
+        at = [0]      # each line as its own element, so the heading rules for html apply to the page
+        for x in lines:
+            at.append(at[-1] + len(x) + 7)
+        pt = "".join(f"<p>{x}</p>" for x in lines)
+        hd, prev = schedule_dates(pt, filed), last
+        ends = any(m[0][0].isupper() and AT_START.search(pt[max(0, m.start() - 80):m.start()]) for m in END_RAW.finditer(pt))
+        last = next((d for p_, d, e in reversed(hd) if e == len(pt)), "" if ends else last)     # a statement or notes page ends the schedule
         if not re.search(key, txt, re.I):
             continue
-        lines = [re.sub(r"\s+", " ", x).strip() for x in txt.splitlines()]
         u = PAGE_UNIT.search(re.sub(r"\s+", " ", txt))
         unit = (1e6 if "million" in u[1].lower() else 1e3) if u else None
-        when = re.findall(MONTH + r" \d{1,2}, \d{4}", txt)
         for j, ln in enumerate(lines):
             if not re.search(key, ln, re.I):
                 continue
@@ -224,7 +317,7 @@ def from_pdf(p: Path, key: str) -> list:
             head = next((h for h in reversed(lines[max(0, j - 60):j]) if re.search(r"\b(value|cost)\b", h, re.I) and not re.search(r"\d,\d{3}", h) and len(h) < 200), "")
             order = sorted((re.search(rx, head, re.I).start(), n) for n, rx in labels[1:] if re.search(rx, head, re.I))
             cols = [n for _, n in order]
-            r = dict(method="pdf line", name=ln[:140], qty=None, cost=None, value=None, date="", table=f"page {i + 1}", row=j, header=head[:200], unit="" , unit_factor=unit or 1, raw=ln[:300], problem="", qty_factor=1, as_of=when[0] if when else "")
+            r = dict(method="pdf line", name=ln[:140], qty=None, cost=None, value=None, date="", table=f"page {i + 1}", row=j, header=head[:200], unit="" , unit_factor=unit or 1, raw=ln[:300], problem="", qty_factor=1, as_of=as_of(hd, at[j], prev))
             r["unit"] = u[0][:60] if u else "no unit printed; dollars"
             if cols and len(nums) >= len(cols):
                 for n, v in zip(cols, nums[-len(cols):]):
@@ -237,21 +330,21 @@ def from_pdf(p: Path, key: str) -> list:
 
 
 def scan(job: tuple) -> dict:
-    path, key, cache = job
-    c = Path(cache) / (hashlib.sha1(path.encode()).hexdigest() + ".json")
+    path, key, cache, filed = job
+    c = Path(cache) / (hashlib.sha1((path + CACHE_V).encode()).hexdigest() + ".json")
     if c.exists():
         return json.loads(c.read_text(encoding="utf-8"))
     res = {"path": path, "rows": [], "other": 0, "error": ""}
     try:
         p = Path(path)
         if p.suffix.lower() == ".pdf":
-            res["rows"] += from_pdf(p, key)
+            res["rows"] += from_pdf(p, key, filed)
         else:
             t = p.read_text(encoding="utf-8", errors="ignore")
             t = re.sub(r"</?(?:table|tr|td|th)\b", lambda x: x[0].lower(), t, flags=re.I)     # older filings use capital tags
             tagged = from_ixbrl(t, key)
             res["rows"] += tagged
-            last, seen = [[]], set()
+            last, seen, heads = [[]], set(), None
             for m in re.finditer(key, t, re.I):
                 r = from_table(t, m, key, last)
                 if r is None:
@@ -263,7 +356,9 @@ def scan(job: tuple) -> dict:
                 if k in seen:
                     continue
                 seen.add(k)
-                r["as_of"] = as_of(t, m.start())
+                if heads is None:
+                    heads, period = schedule_dates(t, filed), period_of(t)
+                r["as_of"] = as_of(heads, m.start(), period)
                 res["rows"].append(r)
     except Exception as e:
         res["error"] = f"{type(e).__name__}: {e}"[:160]
@@ -272,8 +367,12 @@ def scan(job: tuple) -> dict:
 
 
 def limit() -> None:
-    import resource
-    resource.setrlimit(resource.RLIMIT_AS, (1400 * 1024 ** 2, 1400 * 1024 ** 2))
+    """Cap a worker's memory where the OS allows it. macOS refuses RLIMIT_AS (ValueError); a worker that dies here hangs the pool, so go on without the cap."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (1400 * 1024 ** 2, 1400 * 1024 ** 2))
+    except (ImportError, ValueError, OSError):
+        pass
 
 
 def main() -> None:
@@ -294,7 +393,7 @@ def main() -> None:
             p = Path(a.dumps) / f / r["file"]
             if p.exists() and p.suffix.lower() in (".htm", ".html", ".pdf") and (not a.only or re.search(a.only, r["form"])):
                 files[str(p)] = r
-    jobs = sorted(((p, key, str(cache)) for p in files), key=lambda j: Path(j[0]).stat().st_size)
+    jobs = sorted(((p, key, str(cache), files[p].get("file_date", "")[:10]) for p in files), key=lambda j: Path(j[0]).stat().st_size)
     head = ["accession", "form", "file_date", "filer", "as_of", "method", "name", "qty", "qty_factor", "cost", "value", "commitment", "unit_factor", "date", "header", "unit", "raw", "table", "row", "problem", "url"]
     n = collections.Counter()
     with mp.Pool(a.workers, initializer=limit, maxtasksperchild=25) as pool, open(ev / "parsed_rows.csv", "w", newline="", encoding="utf-8") as fh:

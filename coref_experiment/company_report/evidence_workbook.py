@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Write the evidence table and a stratified gold check. Every value comes from evidence_rows.csv; nothing is typed here."""
-import collections, csv, random, re, shutil, sys, zipfile
+import collections, csv, json, random, re, shutil, sys, zipfile
 from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.formatting.rule import FormulaRule
@@ -12,6 +12,8 @@ co, title, folder = sys.argv[1], sys.argv[2], Path(sys.argv[3])
 ev = Path(__file__).parent / "out" / co / "evidence"
 R = list(csv.DictReader(open(ev / "evidence_rows.csv", encoding="utf-8")))
 RC = list(csv.DictReader(open(ev / "recall_list.csv", encoding="utf-8")))
+fresh = (ev / "recall_stats.json").exists() and (ev / "recall_stats.json").stat().st_mtime >= (ev / "evidence_rows.csv").stat().st_mtime
+ST = json.loads((ev / "recall_stats.json").read_text(encoding="utf-8")) if fresh else {}     # counts from evidence_recall.py, only when not older than the evidence rows
 F, navy = "Arial", "1F3A5F"
 box = Border(*(Side(style="thin", color="D5DCE3"),) * 4)
 C = [("tier", "Proof", 11), ("filer", "Filer", 30), ("form", "Form", 9), ("file_date", "Filed", 11), ("as_of", "As of", 16), ("name", "Security as printed", 40), ("qty_usd", "Shares / par", 14), ("cost_usd", "Cost ($)", 15), ("value_usd", "Value ($)", 15), ("commitment_usd", "Commitment ($)", 14),
@@ -73,7 +75,9 @@ s["A9"] = "Mentions with no position, left out"; s["B9"] = sum(r["tier"] == "not
 s["A11"] = "Gates"; s["A11"].font = Font(name=F, size=12, bold=True, color=navy)
 name_lines = [r for r in RC if r["kind"] == "name line"]
 why = collections.Counter(r["why"] for r in dict(groups)["C review"])
-gates = [("1 Filing coverage", "Done for name search: 8,439 EDGAR filings accounted for, 48 new or missed filings downloaded"), ("2 Nothing missed", f"{len(name_lines)} of 3,234 number lines in the context windows are not in evidence, listed in 'Not in evidence'; not yet read"), ("3 Gold check", "Open: rows in the gold workbook need a person to tick them"),
+acc = {r["accession"] for r in R}
+gates = [("1 Evidence coverage", f"Open: filing coverage is not checked here; {len({r['accession'] for r in R if r['tier'] != 'not a position'})} filings give evidence rows ({len(acc)} give a row of any kind)" + (f"; the context windows hold {ST['windows_filings']:,} filings, {ST['filings_with_evidence_rows']:,} of them with evidence rows" if ST else "")),
+         ("2 Nothing missed", f"{len(name_lines)}" + (f" of {ST['name_lines_with_numbers']:,}" if ST else "") + " number lines in the context windows are not in evidence, listed in 'Not in evidence'; not yet read"), ("3 Gold check", "Open: rows in the gold workbook need a person to tick them"),
          ("4 Proof on every number", "Done: every row keeps filing, table, row, printed header, printed unit and raw row"), ("5 N-PORT disagreements", f"Open: {why['same shares as an N-PORT row, different value']} rows have the same shares as an N-PORT row and a different value, to be settled by reading the filing")]
 for n, (a, b) in enumerate(gates, 12):
     s.cell(n, 1, a); s.cell(n, 3, b)

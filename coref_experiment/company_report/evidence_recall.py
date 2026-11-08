@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Recall test: every number on a line naming the company in the context-window workbook must be in the evidence rows or be listed. Sentences near a mention that say 'the company' with a money figure are listed too."""
-import collections, csv, re, sys
+import collections, csv, json, re, sys
 from pathlib import Path
 import openpyxl
 csv.field_size_limit(10**8)
 co, book = sys.argv[1], sys.argv[2]
 ev = Path(__file__).parent / "out" / co / "evidence"
+KEY = re.compile(r"«\s*(?:" + json.loads((Path(__file__).parent / "model_config" / f"{co}.json").read_text(encoding="utf-8"))["company"]["name_regex"] + ")", re.I)     # the company's own name, as the windows mark it
 E = collections.defaultdict(set)
 tiers = collections.defaultdict(set)
 for r in csv.DictReader(open(ev / "evidence_rows.csv", encoding="utf-8")):
@@ -30,7 +31,7 @@ for r in rows:
     acc[a] += 1
     for i, ln in enumerate(ls):
         body = re.sub(r"^\s*(>>>)?\s*L\d+\|\s*(>>>)?", "", ln).replace("«", "").replace("»", "").strip()
-        if re.search(r"«\s*data\s?bricks", ln, re.I):
+        if KEY.search(ln):
             k = (a, body[:200])
             if k in seen:
                 continue
@@ -45,7 +46,7 @@ for r in rows:
                 miss.append([r[ix["Form"]], str(r[ix["Filing date"]])[:10], r[ix["Company (filer)"]], a, "name line", body[:360]])
         elif re.search(r"\b(the company|its|it)\b.{0,90}\$\s?\d", ln, re.I) and re.search(r"revenue|run-rate|run rate|valuation|funding|raised|financing|debt", ln, re.I):
             near = ls[max(0, i - 3):i + 1]
-            if any(re.search(r"«\s*data\s?bricks", x, re.I) for x in near):
+            if any(KEY.search(x) for x in near):
                 k = (a, body[:200])
                 if k not in seen:
                     seen.add(k)
@@ -53,5 +54,7 @@ for r in rows:
 with open(ev / "recall_list.csv", "w", newline="", encoding="utf-8") as fh:
     x = csv.writer(fh); x.writerow(["form", "filed", "filer", "accession", "kind", "line"]); x.writerows(miss + coref)
 held = sum(1 for a in acc if a in E)
-print({"windows_filings": len(acc), "filings_with_evidence_rows": held, "name_lines_with_numbers": lines, "not_in_evidence": len(miss), "company_lines_to_read": len(coref)})
+st = {"windows_filings": len(acc), "filings_with_evidence_rows": held, "name_lines_with_numbers": lines, "not_in_evidence": len(miss), "company_lines_to_read": len(coref)}
+(ev / "recall_stats.json").write_text(json.dumps(st), encoding="utf-8")     # read by evidence_workbook.py for its gates
+print(st)
 print(collections.Counter(m[0] for m in miss).most_common(10))

@@ -5,6 +5,7 @@
     A  N-PORT      value (and shares where printed) equal a Form N-PORT row of the same date
     B  stated      column header and unit printed, no second source
     C  review      no unit printed and no second source, per-share value out of range, or differs from N-PORT
+The per-share range test needs an N-PORT mark within mark_window_months (model_config, default 3) of the row's date; with no mark that close the row stays B.
 """
 import collections, csv, datetime as dt, json, re, sys
 from pathlib import Path
@@ -14,12 +15,14 @@ HERE = Path(__file__).parent
 ev = HERE / "out" / co / "evidence"
 cfg = json.loads((HERE / "model_config" / f"{co}.json").read_text(encoding="utf-8"))
 day_, ratio = cfg.get("split_date", "0"), cfg.get("split_ratio", 1)
+win = cfg.get("mark_window_months", 3)     # an N-PORT mark further than this from the row's date says nothing about the row's price
 P = list(csv.DictReader(open(ev / "parsed_rows.csv", encoding="utf-8")))
-np_ = list(csv.DictReader(open(HERE.parents[2] / "dumps" / f"{co}_nport" / "nport_holdings.csv", encoding="utf-8")))
+npf, mkf = HERE.parents[2] / "dumps" / f"{co}_nport" / "nport_holdings.csv", HERE / "inputs" / co / "data" / "nport_price_monthly.csv"
+np_ = list(csv.DictReader(open(npf, encoding="utf-8"))) if npf.exists() else []     # a company no fund reports on N-PORT has none
 by = collections.defaultdict(list)
 for r in np_:
     by[r["report_date"]].append((float(r["value_usd"] or 0), float(r["shares"] or r["par_or_units"] or 0)))
-marks = {r["month"]: float(r["median_price"]) for r in csv.DictReader(open(HERE / "inputs" / co / "data" / "nport_price_monthly.csv", encoding="utf-8"))}
+marks = {r["month"]: float(r["median_price"]) for r in csv.DictReader(open(mkf, encoding="utf-8")) if r.get("median_price")} if mkf.exists() else {}
 
 
 def f(x):
@@ -27,10 +30,16 @@ def f(x):
 
 
 def iso(s):
-    try:
-        return dt.datetime.strptime(s, "%B %d, %Y").date().isoformat()
-    except ValueError:
-        return ""
+    for fmt in ("%B %d, %Y", "%Y-%m-%d"):     # schedule headings print 'March 31, 2017'; iXBRL contexts give 2017-03-31
+        try:
+            return dt.datetime.strptime(s.strip(), fmt).date().isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
+def months(x):
+    return int(x[:4]) * 12 + int(x[5:7])
 
 
 out = []
@@ -61,8 +70,8 @@ for r in P:
         else:
             m = None
             if marks and val and qty and d:
-                k = min(marks, key=lambda x: abs(int(x[:4]) * 12 + int(x[5:]) - int(d[:4]) * 12 - int(d[5:7])))
-                m = marks[k]
+                k = min(marks, key=lambda x: abs(months(x) - months(d)))
+                m = marks[k] if abs(months(k) - months(d)) <= win else None
             loan = val and qty and 0.7 <= val / qty <= 1.3      # par and value: a loan, not shares
             if m and not loan and not m / 3 <= val / qty / (ratio if d < day_ else 1) <= m * 3:
                 tier, why = "C review", "per-share value out of range"
