@@ -331,6 +331,7 @@ def extract_text(path: Path, opts: ExtractOptions) -> ExtractResult:
 _BLOCK_TAGS = ["p", "div", "section", "article", "header", "footer", "li", "ul", "ol",
                "h1", "h2", "h3", "h4", "h5", "h6", "tr", "table", "blockquote", "pre",
                "dd", "dt", "caption", "title", "main", "aside", "nav", "form"]
+_COL_GAP = re.compile(r"[ \t\xa0]{2,}")  # column gap in a <pre> table
 _HIDDEN_STYLE = re.compile(r"display\s*:\s*none", re.I)
 _CONT_WORDS = ({s.lower() for s in DEFAULT_LEGAL_SUFFIXES} | {s.lower() for s in DEFAULT_ENTITY_WORDS}
                | {"ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "l", "p", "n", "a"})
@@ -399,7 +400,7 @@ def html_to_units(data: bytes | str, res: ExtractResult, base_loc: dict | None =
     """Extract an (i)XBRL/HTML document into res.units.  Tables become row units
     (one cell = one match scope, wrapped names merged); text between tables
     becomes text units with section markers.  Returns filer facts found."""
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, NavigableString
 
     base_loc = dict(base_loc or {})
     tracker = tracker or SectionTracker()
@@ -455,12 +456,18 @@ def html_to_units(data: bytes | str, res: ExtractResult, base_loc: dict | None =
     for n, t in enumerate(tables):
         rows_per_table.append(_table_rows(t))
         t.replace_with(soup.new_string("\n" + _TABLE_MARK.format(n) + "\n"))
+    for pre in soup.find_all("pre"):  # fixed-width schedule: keep column gaps (sentinel survives the collapse)
+        for s in pre.find_all(string=True):
+            if type(s) is NavigableString and _COL_GAP.search(s):
+                s.replace_with(NavigableString(_COL_GAP.sub("\x01", s)))
     for t in soup.find_all(_BLOCK_TAGS):
         t.append("\n")
     txt = soup.get_text()
     txt = re.sub(r"[ \t\r\f\v\xa0]+", " ", txt)
     txt = re.sub(r" *\n *", "\n", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
+    txt = re.sub(r"(?m)^[ \x01]+|[ \x01]+$", "", txt) if "\x01" in txt else txt
+    txt = re.sub(r" ?\x01+ ?", "  ", txt)
 
     if "name" not in facts:
         cover = _registrant_from_cover(re.sub(r"\x00TBL\d+\x00", "", txt))

@@ -1,6 +1,7 @@
 """Result types shared by matchers, the runner and output writers."""
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -81,6 +82,20 @@ class Passage:
         }
 
 
+def unit_key(m: Mention) -> tuple:
+    """Where a mention's char offsets live: its extraction unit (and table cell).
+
+    ``location_detail`` minus ``line`` (derived from the offset): PDF page,
+    EDGAR ``doc``, HTML ``text_block`` / ``table``+``row``+``col``, sheet+cell,
+    DOCX paragraph ... Falls back to ``page`` when no location was recorded.
+    Without it, unpaged formats (HTML/iXBRL/TXT) would put every unit at page
+    None and offset 0..n in one bucket.
+    """
+    loc = m.location_detail or {}
+    items = tuple(sorted((str(k), str(v)) for k, v in loc.items() if k != "line"))
+    return items or (("page", str(m.page)),)
+
+
 def dedupe_identical(mentions: list[Mention]) -> list[Mention]:
     """Drop repeated hits of the same company on the same span.
 
@@ -109,9 +124,10 @@ def dedupe_output(mentions: list[Mention]) -> list[Mention]:
 
     Grouping
     --------
-    Key = ``(document, page, char_start, char_end)`` when ``char_end > char_start``.
-    ``page`` is the extract unit (PDF page / slide / sheet) because offsets are
-    unit-local — without it, page 1 and page 2 at ``0:9`` would wrongly merge.
+    Key = ``(document, page, unit_key, char_start, char_end, matched_text)`` when ``char_end >
+    char_start``. Offsets are local to the extract unit (PDF page, HTML text block,
+    table row *cell*), so :func:`unit_key` is part of the key — without it two
+    HTML table rows both starting with the name at ``0:13`` would wrongly merge.
     Never group by ``matched_text`` alone; never whole-file collapse.
 
     Rows **without** a usable char span (future LLM rows) each keep their own
@@ -141,8 +157,11 @@ def dedupe_output(mentions: list[Mention]) -> list[Mention]:
 
     def group_key(m: Mention, idx: int) -> tuple:
         if has_span(m):
-            # page = extract unit so local offsets on different pages stay apart
-            return ("span", m.document or "", m.page, int(m.char_start), int(m.char_end))
+            # unit (page / block / table row+cell) so local offsets in different units stay apart
+            # + matched_text: one span of one unit has one text, so this only splits
+            # units that share a label (Form D: two issuerPreviousName values)
+            return ("span", m.document or "", m.page, unit_key(m),
+                    int(m.char_start), int(m.char_end), m.matched_text or "")
         # No span: never merge by name / matched_text (LLM-safe)
         return ("noscope", idx)
 
@@ -190,13 +209,76 @@ def mention_hits(m) -> int:
         return 1
 
 
+_TABLE_LINE = re.compile(r"\S(?:\t| {2,})[$(]?\d")  # fixed-width text table: gap then a number
+
+
+def _passage_scope(m: Mention, body: str) -> tuple:
+    """Paragraph identity inside the document: unit (page / text block / table
+    row, cells of one row together) plus, for a fixed-width text table (most
+    lines have a column gap before a number), the line -- each line is a row."""
+    scope = tuple(x for x in unit_key(m) if x[0] not in ("col", "cell"))
+    lines = [ln for ln in (m.passage or "").split("\n") if ln.strip()]
+    if len(lines) > 1 and m.line_number is not None and \
+            2 * sum(1 for ln in lines if _TABLE_LINE.search(ln)) >= len(lines):
+        scope += (("line", str(m.line_number)),)
+    return scope
+
+
+_DIGIT = re.compile(r"\d")
+
+
+def _passage_base(group: list[Mention]) -> int | None:
+    """Offset of ``passage`` in the hits' unit text: the one shift that puts every
+    hit's ``matched_text`` at its char span in the (shared) passage, else None
+    (hits in different cells of one row use cell-local offsets)."""
+    first, text = group[0], group[0].passage or ""
+    surf = first.matched_text or ""
+    if not surf or first.char_start is None:
+        return None
+    pos = text.find(surf)
+    while pos >= 0:
+        base = first.char_start - pos
+        if all(m.char_start is not None and m.char_end is not None and m.char_start >= base
+               and text[m.char_start - base: m.char_end - base].lower() == (m.matched_text or "").lower()
+               for m in group):
+            return base
+        pos = text.find(surf, pos + 1)
+    return None
+
+
+def _split_rows(group: list[Mention]) -> list[list[Mention]]:
+    """Split one paragraph's hits into data rows: a digit (date, amount, share
+    count) between two hits means they sit on separate rows of a schedule --
+    any format (PDF page, <pre>, minified HTML, TXT). No digit between them =
+    a repeated name in prose, kept together."""
+    base = _passage_base(group) if len(group) > 1 else None
+    if base is None:
+        return [group]
+    text = group[0].passage or ""
+    hits = sorted(group, key=lambda m: (m.char_start, m.char_end))
+    rows, cur = [], [hits[0]]
+    for m in hits[1:]:
+        end = max(x.char_end for x in cur)
+        if _DIGIT.search(text[end - base: m.char_start - base] if m.char_start > end else ""):
+            rows.append(cur)
+            cur = []
+        cur.append(m)
+    rows.append(cur)
+    return rows
+
+
 def dedupe_passages(mentions: list[Mention]) -> list[Mention]:
     """One mention per company per paragraph (run after :func:`dedupe_output`).
 
     Once a company's name or any alias has matched a paragraph, further hits
-    of that **same company** in that paragraph (same document + page) add no
-    evidence. Key = ``(company_id, document, page, passage)`` with whitespace
-    normalised (``context`` when ``passage`` is empty). Keeps the best score,
+    of that **same company** in that paragraph add no evidence. Key =
+    ``(company_id, document, page, unit, passage)`` with whitespace normalised
+    (``context`` when ``passage`` is empty); unit = :func:`_passage_scope`
+    (text block / table row / page, and the line in a fixed-width text table),
+    so two table rows -- even with identical text -- stay separate and an
+    unpaged HTML/TXT filing is not collapsed to one row. Inside a paragraph,
+    hits with a digit between them are separate data rows (:func:`_split_rows`:
+    PDF schedule page, <pre>, minified HTML). Per row keeps the best score,
     then earliest ``char_start``. Collapsed surfaces go to
     ``extras["also_matched"]`` and the raw hit count to
     ``extras["hits_in_passage"]`` so ``mention_count`` stays honest.
@@ -208,7 +290,7 @@ def dedupe_passages(mentions: list[Mention]) -> list[Mention]:
     order: list[tuple] = []
     for idx, m in enumerate(mentions):
         body = _norm_text(m.passage) or _norm_text(m.context)
-        key = (("p", m.company_id, m.document or "", str(m.page), body)
+        key = (("p", m.company_id, m.document or "", str(m.page), _passage_scope(m, body), body)
                if body else ("noscope", idx))
         if key not in buckets:
             buckets[key] = []
@@ -217,21 +299,25 @@ def dedupe_passages(mentions: list[Mention]) -> list[Mention]:
 
     out: list[Mention] = []
     for key in order:
-        group = buckets[key]
-        if len(group) == 1:
-            out.append(group[0])
-            continue
-        keep = min(group, key=lambda m: (-float(m.score or 0), m.char_start or 0))
-        others: list[str] = []
-        for m in group:
-            surface = m.matched_text or ""
-            if surface and surface != keep.matched_text and surface not in others:
-                others.append(surface)
-        extras = dict(keep.extras or {})
-        extras["hits_in_passage"] = sum(mention_hits(m) for m in group)
-        if others:
-            extras["also_matched"] = others
-        keep.extras = extras
-        out.append(keep)
+        rows = _split_rows(buckets[key]) if key[0] == "p" else [buckets[key]]
+        for group in rows:
+            out.append(_collapse(group))
     return out
 
+
+def _collapse(group: list[Mention]) -> Mention:
+    """Keep the best hit of one row (score, then earliest); record the rest."""
+    if len(group) == 1:
+        return group[0]
+    keep = min(group, key=lambda m: (-float(m.score or 0), m.char_start or 0))
+    others: list[str] = []
+    for m in group:
+        surface = m.matched_text or ""
+        if surface and surface != keep.matched_text and surface not in others:
+            others.append(surface)
+    extras = dict(keep.extras or {})
+    extras["hits_in_passage"] = sum(mention_hits(m) for m in group)
+    if others:
+        extras["also_matched"] = others
+    keep.extras = extras
+    return keep

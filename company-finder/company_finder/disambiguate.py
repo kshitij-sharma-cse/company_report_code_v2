@@ -16,10 +16,12 @@ for every item in it. It is not a provider-side async Batch API (submit now,
 collect results later at a discount); OpenRouter does not expose that for
 this kind of call, so this is the practical way to cut call volume.
 
-Fail-open throughout: a batch's provider error, or any item missing from a
-parsed response, leaves those specific mentions untouched (kept) and appends
-a note to ``warnings`` -- this pass only ever removes a mention it got an
-explicit "no" for.
+Fail-open per mention: a batch's provider error, or any item missing from a
+parsed response, leaves those specific mentions untouched (kept, flagged
+``unverified``) and appends a note to ``warnings`` -- this pass only ever
+removes a mention it got an explicit "no" for. Mentions left unverified by a
+provider/transport error are counted in ``stats["provider_errors"]`` so the CLI
+can fail the run (exit 3) instead of passing unchecked rows downstream.
 """
 from __future__ import annotations
 
@@ -223,10 +225,12 @@ def _call_with_retry(batch, model: str, timeout: int, retries: int,
 
 def _run_batch(batch, model: str, timeout: int, retries: int,
                limiter: "_RateLimiter | None" = None,
-               max_missing_retries: int = 2) -> tuple[dict[int, dict], list[str]]:
-    """Resolve one batch (thread-safe: touches no shared state). Returns (verdicts, warnings)."""
+               max_missing_retries: int = 2) -> tuple[dict[int, dict], list[str], set[int]]:
+    """Resolve one batch (thread-safe: touches no shared state).
+    Returns (verdicts, warnings, indexes left without a verdict by a provider error)."""
     verdicts: dict[int, dict] = {}
     notes: list[str] = []
+    errored: set[int] = set()
     retry_batch = batch
     for attempt in range(1 + max_missing_retries):
         try:
@@ -236,12 +240,20 @@ def _run_batch(batch, model: str, timeout: int, retries: int,
             notes.append(f"llm_disambiguate: batch of {len(retry_batch)} "
                          f"({', '.join(companies)}) left UNVERIFIED after provider error "
                          f"(retried {retries}x if transient): {exc}")
+            errored = {t[0] for t in retry_batch}
             break
         still_missing = [t for t in retry_batch if t[0] not in verdicts]
         if not still_missing:
             break
         retry_batch = still_missing
-    return verdicts, notes
+    return verdicts, notes, errored
+
+
+def _proven_by_structure(m: Mention) -> bool:
+    """Identity fixed by filing structure, not by reading text: a CIK match, or a
+    filer field of a Form D (issuer name / previous names). Prose -- even in the
+    filer's own documents -- still goes to the LLM."""
+    return m.match_type == "cik" or (bool(m.is_filer) and "form_d_field" in (m.location_detail or {}))
 
 
 def disambiguate_common_words(matcher, mentions: list[Mention], *, model: str,
@@ -265,27 +277,38 @@ def disambiguate_common_words(matcher, mentions: list[Mention], *, model: str,
     is rescaled to 0-100). A mention is removed only on an explicit "no" (or a low
     confidence "yes").
 
+    Skipped (kept, ``status: skipped``): mentions :func:`_proven_by_structure`.
+
     Fail-open: a mention that still has no verdict after retries is KEPT, but it is
-    marked ``extras["llm_disambiguation"] = {"status": "unverified"}`` and counted in
-    ``stats["unverified"]`` so the caller can report it instead of hiding it.
+    marked ``extras["llm_disambiguation"] = {"status": "unverified", "cause": ...}`` and
+    counted in ``stats["unverified"]`` (``stats["provider_errors"]`` when the cause was a
+    provider/transport error, not a model that skipped the item) so the caller can
+    report or fail on it instead of hiding it.
     """
     by_id = {c.id: c for c in matcher.companies}
     passthrough: list[Mention] = []
     candidates: list[tuple[int, Company, Mention]] = []
+    structural = 0
     for i, m in enumerate(mentions):
         company = by_id.get(m.company_id)
         if company is None:
             passthrough.append(m)
+        elif _proven_by_structure(m):  # CIK / filer's own Form D field: nothing for the LLM to judge
+            m.extras = {**(m.extras or {}), "llm_disambiguation": {"status": "skipped", "cause": "structural"}}
+            passthrough.append(m)
+            structural += 1
         else:
             candidates.append((i, company, m))
 
     batches = [candidates[s:s + batch_size] for s in range(0, len(candidates), batch_size)]
     verdicts: dict[int, dict] = {}
+    errored: set[int] = set()
     limiter = _RateLimiter(max_rpm)
 
     def _collect(result):
-        v, notes = result
+        v, notes, err = result
         verdicts.update(v)
+        errored.update(err)
         if warnings is not None:
             warnings.extend(notes)
 
@@ -298,13 +321,15 @@ def disambiguate_common_words(matcher, mentions: list[Mention], *, model: str,
                 _collect(result)
 
     kept = list(passthrough)
-    unverified = 0
+    unverified = provider_errors = 0
     for idx, company, m in candidates:
         verdict = verdicts.get(idx)
         extras = dict(m.extras or {})
         if verdict is None:
             unverified += 1
-            extras["llm_disambiguation"] = {"status": "unverified"}
+            cause = "provider_error" if idx in errored else "no_verdict"
+            provider_errors += idx in errored
+            extras["llm_disambiguation"] = {"status": "unverified", "cause": cause}
             m.extras = extras
             kept.append(m)  # fail open: no verdict for this item -> keep it, flagged
             continue
@@ -317,6 +342,7 @@ def disambiguate_common_words(matcher, mentions: list[Mention], *, model: str,
             kept.append(m)
         # else: confirmed not the company, or "yes" below the confidence floor -- dropped.
     if stats is not None:
-        stats.update(candidates=len(candidates), unverified=unverified,
+        stats.update(candidates=len(candidates), unverified=unverified, structural=structural,
+                     provider_errors=provider_errors,
                      dropped=len(candidates) - (len(kept) - len(passthrough)))
     return kept

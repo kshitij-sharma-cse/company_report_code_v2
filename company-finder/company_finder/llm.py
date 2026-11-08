@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import sys
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -82,6 +84,19 @@ def load_env_file(path: str | Path | None = None) -> None:
         os.environ.setdefault(key, value)
 
 
+@lru_cache(maxsize=1)
+def ssl_context() -> ssl.SSLContext:
+    """CA bundle for HTTPS: SSL_CERT_FILE/SSL_CERT_DIR when set, else certifi when
+    installed (python.org macOS builds ship no CA store), else the system default."""
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return ssl.create_default_context()
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except (ImportError, OSError, ssl.SSLError):
+        return ssl.create_default_context()
+
+
 def _request_openrouter(payload: dict, api_key: str, timeout: int) -> dict:
     req = Request(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -90,7 +105,7 @@ def _request_openrouter(payload: dict, api_key: str, timeout: int) -> dict:
         method="POST",
     )
     try:
-        with urlopen(req, timeout=timeout) as response:
+        with urlopen(req, timeout=timeout, context=ssl_context()) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         detail = exc.read(500).decode("utf-8", "replace")

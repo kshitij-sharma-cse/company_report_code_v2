@@ -184,6 +184,9 @@ class Config:
     # disambiguate.py's module docstring for why this is a supplementary
     # safety net, not the primary defense.
     llm_disambiguate_min_confidence: int = 50
+    # Exit 0 even when provider/transport errors left mentions unverified
+    # (--allow-unverified). Default False: the CLI writes the output, then exits 3.
+    llm_disambiguate_allow_unverified: bool = False
 
     # Snippet
     context_max_chars: int = 300
@@ -220,7 +223,7 @@ class Config:
                   "llm_disambiguate_common_words", "llm_disambiguate_timeout_seconds",
                   "llm_disambiguate_batch_size", "llm_disambiguate_min_confidence",
                   "llm_disambiguate_workers", "llm_disambiguate_retries",
-                  "llm_disambiguate_max_rpm"):
+                  "llm_disambiguate_max_rpm", "llm_disambiguate_allow_unverified"):
             d.pop(k, None)
         blob = json.dumps(d, sort_keys=True).encode()
         cw = Path(self.common_words_file)
