@@ -153,6 +153,20 @@ def fmt_date(x) -> str:
     return v.strftime("%d %b %Y") if v else "date not stated"
 
 
+LEGAL = re.compile(r"[,\s]+(?:inc|incorporated|corp|corporation|co|llc|l\.l\.c|ltd|limited|l\.?p|plc|pbc|s\.?a|ag|gmbh|n\.?v|b\.?v)\.?$", re.I)
+
+
+def short_name(name: str, cfg: dict) -> str:
+    """The name used in the text: model_config "name", else the legal name without its corporate suffix ("Acme Labs, Inc." -> "Acme Labs")."""
+    s = str(cfg.get("name") or "").strip()
+    if s:
+        return s
+    s = name.strip()
+    while LEGAL.search(s):
+        s = LEGAL.sub("", s).strip()
+    return s or name
+
+
 def norm_name(x: str) -> str:
     x = re.sub(r"[^a-z0-9 ]", " ", (x or "").lower())
     x = re.sub(r"\b(inc|llc|lp|l p|corp|corporation|co|ltd|the|fund)\b", " ", x)
@@ -621,13 +635,202 @@ def join_split_rows(rows: list[dict]) -> list[dict]:
     out = []
     for h in rows:
         e = whole.get((norm_name(h["holder"]), h.get("as_of_date") or "", h.get("fair_value_usd")))
-        if e is None or e is h or h.get("shares") or not h.get("as_of_date"):
+        if e is None or e is h or h.get("shares") or not h.get("as_of_date") or e.get("verified") != h.get("verified"):
             out.append(h)
             continue
         e["cost_usd"] = e.get("cost_usd") or h.get("cost_usd")
         e["acquisition_date"] = e.get("acquisition_date") or h.get("acquisition_date")
         e["sources"] += h["sources"]
     return out
+
+
+# ---------------------------------------------------------------------------------------------- 5a. rule-read evidence rows
+# Holdings numbers come from the table rows read by rule (evidence_tables.py + evidence_build.py), never from the model: the
+# model's row gives the holder, vehicle and position type, the evidence row gives shares, cost, value, unit and dates.
+CIK_TAIL = re.compile(r"\s*\(CIK\s*\d+\)\s*$", re.I)
+ACC = re.compile(r"\d{10}-\d{2}-\d{6}")
+FOOTNOTES = re.compile(r"\((?:[a-z]{1,2}|\d{1,2})\)")
+WRAPPER = re.compile(r"\b(llc|l\.?p|spv|feeder|partners|fund|trust)\b", re.I)
+AI_ONLY = "AI only — not verified"
+
+
+MON = r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b\.?"
+DATE_TOKEN = re.compile(rf"\d{{4}}-\d{{1,2}}-\d{{1,2}}|\d{{1,2}}/\d{{1,2}}/\d{{2,4}}|{MON}\s+\d{{1,2}},?\s+\d{{4}}|\d{{1,2}}/\d{{4}}|{MON}\s+\d{{4}}", re.I)
+
+
+def ev_date(x) -> str:
+    """The first date printed in a table cell (11/7/16, 2016-11-07, Sept. 30, 2016, 11/2016, November 2016; a range '11/7/16 - 4/12/18'
+    gives its first date) as YYYY-MM-DD; a month alone gives its first day; "" when there is no date."""
+    mm = DATE_TOKEN.search(re.sub(r"\s+", " ", str(x or "")))
+    if not mm:
+        return ""
+    t = re.sub(rf"^({MON})", lambda g: g.group(1)[:3], mm.group(0).replace(",", " "), flags=re.I)   # 'Sept.' -> 'Sep'
+    t = re.sub(r"\s+", " ", t).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%y", "%m/%d/%Y", "%b %d %Y", "%m/%Y", "%b %Y"):
+        try:
+            return dt.datetime.strptime(t, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
+def sec_key(name: str) -> str:
+    return norm_name(FOOTNOTES.sub(" ", name or ""))
+
+
+def same_sec(a: str, b: str) -> bool:
+    """One security named in full in one table and shortened in the other ('Acme Inc. Series B' / 'Series B')."""
+    return a == b or f" {a}".endswith(f" {b}") or f" {b}".endswith(f" {a}")
+
+
+def join_lots(v: dict, cs: list[dict]) -> None:
+    """Restricted-securities rows (cost + acquisition date) added to the schedule row of the position: one row, or several lots."""
+    v.update(cost=v["cost"] if v["cost"] is not None else sum(c["cost"] for c in cs), acq=v["acq"] or min((c["acq"] for c in cs if c["acq"]), default=""),
+             as_of=v["as_of"] or next((c["as_of"] for c in cs if c["as_of"]), ""), tier=max([v["tier"]] + [c["tier"] for c in cs]),
+             why="; ".join(x for x in [v["why"]] + [c["why"] for c in cs] if x), raw=" || ".join([v["raw"]] + [c["raw"] for c in cs]),
+             ref=" + ".join([v["ref"]] + [c["ref"] for c in cs]) + (f" ({len(cs)} lots)" if len(cs) > 1 else ""), paired=True)
+
+
+def pair_rows(rows: list[dict]) -> list[dict]:
+    """A cost-only row (restricted securities: cost + acquisition date) joins the value row (shares + value) of the same security in
+    the same filing, when its cost and share count do not differ from the value row's. Several rows of one security (a report printed
+    twice, or covering several funds) pair in table order when the counts agree; several cost rows against one value row are lots of
+    it. A cost row left over beside value rows of the same security is kept for review (tier C), never counted as a second position."""
+    rows = sorted(rows, key=lambda r: r["ord"])
+    val = [r for r in rows if r["value"] is not None or r["commitment"] is not None]
+    cost = [r for r in rows if r["value"] is None and r["commitment"] is None]
+    out = list(val)
+    fits = lambda v, c: ((v["cost"] is None or same_amount(v["cost"], c["cost"])) and                                  # noqa: E731
+                         not (v["shares"] and c["shares"] and not same_amount(v["shares"], c["shares"])))
+    for key in dict.fromkeys(sec_key(r["name"]) for r in cost):
+        cs = [r for r in cost if sec_key(r["name"]) == key]
+        vs = [r for r in val if not r.get("paired") and same_sec(key, sec_key(r["name"]))]
+        if not vs:
+            out += cs                                  # the security is only in the note: its one reading is the position
+            continue
+        if len(cs) != len(vs):                         # the same note row printed twice
+            u = list({(c["cost"], c["acq"], c["shares"]): c for c in cs}.values())
+            cs = u if len(u) == len(vs) else cs
+        if len(cs) == len(vs) and all(fits(v, c) for v, c in zip(vs, cs)):
+            for v, c in zip(vs, cs):
+                join_lots(v, [c])
+            continue
+        lots = len(vs) == 1 and (not vs[0]["shares"] or not any(c["shares"] for c in cs) or same_amount(sum(c["shares"] or 0 for c in cs), vs[0]["shares"]))
+        if lots and (vs[0]["cost"] is None or same_amount(vs[0]["cost"], sum(c["cost"] for c in cs))):
+            join_lots(vs[0], cs)
+            continue
+        left = list(cs)
+        for v in vs:                                   # what is left: a cost row pairs only with a value row of the same cost
+            c = next((c for c in left if v["cost"] is not None and fits(v, c)), None)
+            if c:
+                join_lots(v, [c])
+                left.remove(c)
+        out += [{**c, "tier": "C", "why": "; ".join(x for x in (c["why"], "restricted-securities row not matched to a schedule row") if x)} for c in left]
+    seen, keep = set(), []
+    for r in out:                                      # the same position printed twice in one filing
+        k = (r["shares"], r["cost"], r["value"], r["commitment"], r["acq"], r["as_of"])
+        if k not in seen:
+            seen.add(k)
+            keep.append(r)
+    return keep
+
+
+def load_evidence(path: Path) -> dict | None:
+    """evidence_rows.csv as positions by accession; None when the file is missing (holdings then stay as the model read them)."""
+    if not path.exists():
+        return None
+    f = lambda x: float(x) if x not in (None, "") else None                                        # noqa: E731
+    by: dict = collections.defaultdict(list)
+    seen = set()
+    for r in csv.DictReader(open(path, newline="", encoding="utf-8")):
+        tier = (r.get("tier") or "")[:1]
+        if tier not in ("A", "B", "C"):
+            continue                                   # not a position
+        tab, row = r.get("table") or "", r.get("row") or ""   # a table number, an iXBRL context id, 'page N' or 'text'
+        x = {"accession": r["accession"], "form": r.get("form") or "", "filer": CIK_TAIL.sub("", r.get("filer") or "").strip(), "name": r.get("name") or "",
+             "shares": f(r.get("qty_usd")), "cost": f(r.get("cost_usd")), "value": f(r.get("value_usd")), "commitment": f(r.get("commitment_usd")),
+             "unit": f(r.get("unit_factor")) or 1, "qty_unit": f(r.get("qty_factor")) or 1, "acq": ev_date(r.get("date")),
+             "as_of": ev_date(r.get("report_date")) or ev_date(r.get("as_of")), "file_date": r.get("file_date") or "", "tier": tier,
+             "why": r.get("why") or "", "raw": r.get("raw") or "", "ord": tuple(int(d) for d in re.findall(r"\d+", f"{tab} {row}")) or (0,),
+             "ref": f"table {tab}, row {row}" if row != "" else f"{r.get('method') or 'table'} {tab}", "url": r.get("url") or ""}
+        if x["as_of"] and x["file_date"] and x["as_of"] > x["file_date"]:
+            x["as_of"] = ""                            # a date after the filing is a later event, not the date of the table
+        if x["acq"] and ((x["file_date"] and x["acq"] > x["file_date"]) or r.get("method") == "iXBRL tag" or x["acq"] in (x["as_of"], ev_date(r.get("as_of")))):
+            x["acq"] = ""                              # an iXBRL context date or the report date is the date of the table, not of the purchase
+        k = (x["accession"], tab, row, x["name"])
+        if k in seen or not any(x[c] is not None for c in ("cost", "value", "commitment")):
+            continue
+        seen.add(k)
+        by[x["accession"]].append(x)
+    return {acc: pair_rows(v) for acc, v in by.items()}
+
+
+def same_amount(a, b) -> bool:
+    """Equal at some printed scale: the model often misses a "(000s)" heading or applies it twice."""
+    if a in (None, "") or b in (None, ""):
+        return False
+    a, b = float(a), float(b)
+    return any(abs(a * k - b) <= max(0.5, abs(b) * 1e-6) for k in (1, 1e3, 1e6, 1e-3, 1e-6))
+
+
+def ev_score(h: dict, p: dict, target: str) -> int:
+    """How surely a model row and an evidence position are the same position of one filing: share count and amounts, then the class."""
+    if h.get("shares") and p["shares"] and not same_amount(h["shares"], p["shares"]):
+        return 0                                       # another position (another fund or class)
+    s = 2 * same_amount(h.get("shares"), p["shares"])
+    s += 2 * any(same_amount(h.get(a), p[b]) for a, b in (("fair_value_usd", "value"), ("cost_usd", "cost"), ("commitment_usd", "commitment")))
+    s += any(same_amount(h.get(a), p[b]) for a, b in (("fair_value_usd", "cost"), ("cost_usd", "value"), ("fair_value_usd", "commitment"), ("commitment_usd", "value")))
+    cls = set(sec_key(p["name"]).split()) - set(norm_name(target).split())
+    return s + bool(cls and cls <= set(norm_name(h.get("security") or "").split()))
+
+
+def ai_values(h: dict) -> str:
+    return "; ".join((f"{k} {h[k]:,.0f}" if float(h[k]).is_integer() else f"{k} {h[k]:g}") if isinstance(h.get(k), (int, float)) else f"{k} {h[k]}" for k in
+                     ("shares", "cost_usd", "fair_value_usd", "commitment_usd", "pct_net_assets", "acquisition_date", "as_of_date") if h.get(k) not in (None, ""))
+
+
+def from_evidence(h: dict | None, p: dict, tiers: set, target: str, missed: str = "missed by AI") -> dict:
+    """One holdings row with the numbers of evidence position p; h is the model's row of the same position (None if it missed it)."""
+    ok, ai = p["tier"] in tiers, h or {}
+    if h is None:
+        sec = re.sub(r"\s+", " ", FOOTNOTES.sub(" ", p["name"])).strip()
+        rest = re.sub(re.escape(target.split(",")[0]), " ", sec, flags=re.I)
+        h = {"holder": p["filer"], "vehicle": "direct" if norm_name(target.split(",")[0]) in norm_name(sec) and not WRAPPER.search(rest) else sec,
+             "security": sec, "evidence": p["raw"], "confidence": 100, "check": "ok", "shared_with": "", "page": ""}
+    how = "evidence tier {t}; holder and type from AI" if ai else "evidence tier {t}; " + missed
+    r = {**h, "shares": p["shares"], "cost_usd": p["cost"], "fair_value_usd": p["value"], "commitment_usd": p["commitment"],
+         "value_scale": int(p["unit"]), "shares_scale": int(p["qty_unit"]), "pct_net_assets": None, "acquisition_date": p["acq"] or None,
+         "as_of_date": p["as_of"], "ai_as_of_date": ai.get("as_of_date") or "", "ai_values": ai_values(ai), "evidence_tier": p["tier"],
+         "evidence_row": f"{p['ref']}: {p['raw']}"[:400], "verified": "yes" if ok else "no",
+         "source": how.format(t=p["tier"]) if ok else f"evidence tier {p['tier']}, review ({p['why'] or 'tier not used'}); not verified"}
+    r = r if r.get("position_type") else classify_position(r)
+    if r["position_type"] in ("funded_loan", "unfunded_commitment"):
+        r["shares"] = None                             # a loan's par is not a share count
+    return r
+
+
+def reconcile(ai: list[dict], pos: list[dict], target: str, tiers: set, missed: str = "missed by AI") -> list[dict]:
+    """One filing: each model row takes the numbers of the evidence position it matches; positions the model missed are added;
+    model rows that no evidence row confirms are kept as AI only, out of every figure."""
+    # best pairs first (score, then a share-count match, then table order), each model row and each position used once
+    sc = {(i, j): ev_score(h, p, target) for i, h in enumerate(ai) for j, p in enumerate(pos)}
+    pairs = sorted((k for k, s in sc.items() if s >= 2), key=lambda k: (-sc[k], -same_amount(ai[k[0]].get("shares"), pos[k[1]]["shares"]), k[1], k[0]))
+    row_of, used = {}, {}
+    for i, j in pairs:
+        if i not in row_of and j not in used:
+            row_of[i] = used[j] = from_evidence(ai[i], pos[j], tiers, target)
+    out = []
+    for i, h in enumerate(ai):
+        if i in row_of:
+            out.append(row_of[i])
+            continue
+        js = [j for j in range(len(pos)) if sc[(i, j)] >= 2]
+        if js:                                         # a second model row of a position taken (shares in one, cost in the other)
+            e = used[max(js, key=lambda j: (sc[(i, j)], -j))]
+            e["ai_values"] = "; ".join(x for x in (e["ai_values"], ai_values(h)) if x)
+        elif h.get("cost_usd") or h.get("fair_value_usd") or h.get("commitment_usd"):
+            out.append({**h, "source": AI_ONLY, "verified": "no", "ai_values": ai_values(h)})
+    return out + [from_evidence(None, p, tiers, target, missed) for j, p in enumerate(pos) if j not in used]
 
 
 def fix_lender_direction(rels: list[dict], target: str) -> int:
@@ -641,36 +844,63 @@ def fix_lender_direction(rels: list[dict], target: str) -> int:
     return n
 
 
-def merge(filings: list[dict], per_filing: dict) -> tuple[list[dict], list[dict]]:
+def merge(filings: list[dict], per_filing: dict, evidence: dict | None = None, tiers: set = frozenset("AB"), target: str = "",
+          add_unread: bool = True) -> tuple[list[dict], list[dict]]:
     """Holdings and facts over all filings, one row per distinct value; the latest filing is kept as the source and the
-    others are counted."""
+    others are counted. With evidence rows (load_evidence), every holdings number comes from them (see reconcile): one reconcile per
+    accession (all its documents together); evidence positions of filings the mention step never prepared are added too
+    (add_unread; off for a pilot) and counted in merge.unread."""
     hold: dict = {}
     fact: dict = {}
-    for m in filings:
-        data = per_filing.get(m["stem"], {})
-        src = {"form": m["form"], "filing_date": m["file_date"], "filer": m["filer"], "sec_url": m["sec_url"], "document": m["document"]}
-        for h in data.get("holdings", []):
-            if h.get("check") != "ok" or (h.get("confidence") or 0) < 50:
-                continue
-            h = classify_position(h)
-            if not h.get("cost_usd") and not h.get("fair_value_usd") and not h.get("commitment_usd"):
-                continue                       # a share count with no value says nothing about valuation
+    groups: dict = {}
+    for m in filings:                                  # an accession can hold several documents (6-K exhibits, N-CSR parts)
+        groups.setdefault(m.get("accession") or (ACC.search(m["stem"]) or [m["stem"]])[0], []).append(m)
+    merge.unread = [0, 0]
+    if evidence is not None:
+        for acc in sorted(set(evidence) - set(groups)):
+            p = evidence[acc][0]
+            merge.unread[0] += 1
+            merge.unread[1] += len(evidence[acc])
+            if add_unread:
+                groups[acc] = [{"stem": acc, "accession": acc, "form": p["form"], "file_date": p["file_date"], "filer": p["filer"],
+                                "sec_url": p["url"], "document": "", "unread": True}]
+    for acc, ms in groups.items():
+        ai = []
+        for k, m in enumerate(ms):
+            for h in per_filing.get(m["stem"], {}).get("holdings", []):
+                if h.get("check") != "ok" or (h.get("confidence") or 0) < 50:
+                    continue
+                h = classify_position(h)
+                if h.get("cost_usd") or h.get("fair_value_usd") or h.get("commitment_usd") or (evidence is not None and h.get("shares")):
+                    ai.append({**h, "_m": k})  # a share count with no value says nothing about valuation, but can find its evidence row
+        if evidence is not None:
+            rows = reconcile(ai, evidence.get(acc, []), target, tiers, "filing not read by AI" if ms[0].get("unread") else "missed by AI")
+        else:
+            rows = [{**h, "source": "AI (no evidence file)", "verified": "yes"} for h in ai]
+        for h in rows:
+            m = ms[h.pop("_m", 0)]                     # a model row keeps its own document; an evidence-only row the first one
+            src = {"form": m["form"], "filing_date": m["file_date"], "filer": m["filer"], "sec_url": m["sec_url"], "document": m["document"]}
             vehicle = re.sub(r"[\d¹²³⁴⁵⁶⁷⁸⁹]+$", "", norm_name(h["vehicle"])).strip()   # 'SPV³', 'SPV 2' -> 'spv'
+            day = h.get("as_of_date") or acc   # undated rows of two filings can be two dates: kept apart
             if h.get("shares"):                # same position, same date, same value = one row (fill gaps from repeats)
-                key = (norm_name(h["holder"]), h.get("as_of_date") or "", h["shares"], h.get("fair_value_usd"))
+                key = (norm_name(h["holder"]), day, h["shares"], h.get("fair_value_usd"), h["verified"])
             else:
-                key = (norm_name(h["holder"]), vehicle, h.get("as_of_date") or "", h.get("cost_usd"), h.get("fair_value_usd"), h.get("commitment_usd"))
-            e = hold.setdefault(key, {**h, "sources": 0})
+                key = (norm_name(h["holder"]), vehicle, day, h.get("cost_usd"), h.get("fair_value_usd"), h.get("commitment_usd"), h["verified"])
+            e = hold.setdefault(key, {**h, "sources": 0, "accessions": "", "seen": [], "first_filing_date": m["file_date"]})
             filled = {k: (v if v not in (None, "") else e.get(k)) for k, v in h.items()}
-            e.update({**filled, **src, "sources": e["sources"] + 1})
-        for f in data.get("facts", []):
-            if f.get("check") != "ok" or (f.get("confidence") or 0) < 50:
-                continue
-            if m["form"].startswith(("485", "486")) and f["metric"] in ETF_BOILERPLATE:
-                continue                       # a series registration describes a planned product, not the company
-            key = (f["metric"], f.get("as_of_date") or "", f.get("value_number"), d.norm(f.get("value_text", ""))[:60])
-            e = fact.setdefault(key, {**f, "sources": 0})
-            e.update({**f, **src, "sources": e["sources"] + 1})
+            e.update({**filled, **src, "sources": e["sources"] + 1, "accessions": ";".join(x for x in (e["accessions"], acc) if x)})
+            e["seen"].append((m["form"], m["file_date"], m["filer"], m["sec_url"], h.get("evidence") or ""))
+        for m in ms:
+            data = per_filing.get(m["stem"], {})
+            src = {"form": m["form"], "filing_date": m["file_date"], "filer": m["filer"], "sec_url": m["sec_url"], "document": m["document"]}
+            for f in data.get("facts", []):
+                if f.get("check") != "ok" or (f.get("confidence") or 0) < 50:
+                    continue
+                if m["form"].startswith(("485", "486")) and f["metric"] in ETF_BOILERPLATE:
+                    continue                       # a series registration describes a planned product, not the company
+                key = (f["metric"], f.get("as_of_date") or "", f.get("value_number"), d.norm(f.get("value_text", ""))[:60])
+                e = fact.setdefault(key, {**f, "sources": 0})
+                e.update({**f, **src, "sources": e["sources"] + 1})
     holdings = join_split_rows(sorted(hold.values(), key=lambda h: (norm_name(h["holder"]), h.get("as_of_date") or "", h["filing_date"])))
     for h in holdings:
         is_debt = h["position_type"] in ("funded_loan", "unfunded_commitment")   # a loan's par amount is not a share count
@@ -717,6 +947,11 @@ def adjusted(value: float, day, split) -> float:
     return value / split[1] if split and day and day < split[0] else value
 
 
+def from_rows(h: dict) -> bool:
+    """Numbers taken from a rule-read evidence row (not to be corrected by rule or by the model)."""
+    return (h.get("source") or "").startswith("evidence")
+
+
 def price_series(holdings: list[dict], split=None) -> list[dict]:
     """One mark per (holder, vehicle, as-of date) with shares: cost basis at the acquisition date, fair value at the as-of
     date. Undated rows are left out of the series (they stay in the holdings table)."""
@@ -735,8 +970,9 @@ def price_series(holdings: list[dict], split=None) -> list[dict]:
                                                             "filed": h["price_per_share"], "src": h}
     vals = sorted(p["value"] for p in pts.values())
     mid = vals[len(vals) // 2] if vals else 0
-    # drop a date after the filing (a maturity, not an as-of date) and values 10x off the median (units read wrongly)
-    keep = [p for p in pts.values() if p["date"] <= as_date(p["src"]["filing_date"]) and mid / 10 <= p["value"] <= mid * 10]
+    # drop a date after the filing (a maturity, not an as-of date) and model values 10x off the median (units read wrongly); a value
+    # from a rule-read evidence row has its unit printed, so a real fall or rise stays in
+    keep = [p for p in pts.values() if p["date"] <= as_date(p["src"]["filing_date"]) and (from_rows(p["src"]) or mid / 10 <= p["value"] <= mid * 10)]
     return sorted(keep, key=lambda p: (p["date"], p["holder"]))
 
 
@@ -755,6 +991,39 @@ def rel_edges(rels: list[dict], target: str) -> list[dict]:
         if r["filing_date"] < e["first"]:
             e.update(first=r["filing_date"], quote=r["evidence_quote"], form=r["form"], sec_url=r["sec_url"])
     return sorted(edges.values(), key=lambda e: e["first"])
+
+
+def holder_edges(edges: list[dict], holdings: list[dict], target: str) -> list[dict]:
+    """A holder's invests_in (equity) or lends_to (loan) link to the company is first stated by the earliest filing that reports its
+    position (evidence-backed holdings rows; AI-only rows do not count) when that is earlier than its first relationship row of that
+    relation; a holder with positions and no such relationship row gets one. Other relations are left as they are."""
+    t = norm_name(target)
+    rel_of = lambda h: "lends_to" if h["position_type"] in ("funded_loan", "unfunded_commitment") else "invests_in"   # noqa: E731
+    by: dict = collections.defaultdict(list)
+    for h in holdings:
+        if h.get("source") == AI_ONLY:
+            continue
+        for k in {norm_name(h["holder"]), norm_name(CIK_TAIL.sub("", h.get("filer") or ""))} - {""}:
+            by[(k, rel_of(h))] += [(*x, h) for x in h.get("seen", [])]
+    done = set()
+    for e in edges:
+        k = (norm_name(e["from"]), e["relation"])
+        if norm_name(e["to"]) != t or not by.get(k):
+            continue
+        done.add(k)
+        for form, day, filer, url, quote, h in sorted(by[k], key=lambda x: x[1]):
+            e["filings"].add((form, day, filer))
+            if day < e["first"]:
+                e.update(first=day, form=form, sec_url=url, quote=quote or e["quote"])
+                e["checks"]["first date from a holdings row"] = 1
+    for (k, rel), seen in by.items():
+        hs = [x for x in seen if norm_name(x[5]["holder"]) == k]
+        if (k, rel) in done or not hs or any((norm_name(CIK_TAIL.sub("", x[5].get("filer") or "")), rel) in done for x in hs):
+            continue
+        form, day, filer, url, quote, h = min(hs, key=lambda x: x[1])
+        edges.append({"from": h["holder"], "relation": rel, "to": target, "rows": 0, "filings": {x[:3] for x in hs}, "first": day, "quote": quote,
+                      "checks": collections.Counter({"from holdings rows only": len(hs)}), "form": form, "sec_url": url})
+    return sorted(edges, key=lambda e: e["first"])
 
 
 # ---------------------------------------------------------------------------------------------- charts (inline SVG)
@@ -804,7 +1073,7 @@ def svg_marks(pts: list[dict], title: str, w: int = 640, h: int = 240) -> str:
     for frac in (0, 0.5, 1):
         y = Y(top * frac)
         out.append(f'<line x1="{l}" x2="{w - r}" y1="{y:.1f}" y2="{y:.1f}" stroke="{GRID if frac else AXIS}" stroke-width="1"/>')
-        out.append(f'<text x="{l - 6}" y="{y + 4:.1f}" text-anchor="end" class="ax">${top * frac:,.0f}</text>')
+        out.append(f'<text x="{l - 6}" y="{y + 4:.1f}" text-anchor="end" class="ax">{model_report.pps(top * frac)}</text>')
     months = sorted({p["date"].replace(day=1) for p in pts})
     for dd in months[::max(1, len(months) // 8)]:
         if d0 <= dd <= d1 or len(pts) == 1:
@@ -819,9 +1088,9 @@ def svg_marks(pts: list[dict], title: str, w: int = 640, h: int = 240) -> str:
         for p in ser:
             fill = col if p["kind"] == "fair value" else SURF
             out.append(f'<circle cx="{X(p["date"]):.1f}" cy="{Y(p["value"]):.1f}" r="4.5" fill="{fill}" stroke="{col}" stroke-width="2">'
-                       f'<title>{esc(hd)} · {p["kind"]} · {fmt_date(p["date"])}: ${p["value"]:,.2f} per share</title></circle>')
+                       f'<title>{esc(hd)} · {p["kind"]} · {fmt_date(p["date"])}: {model_report.pps(p["value"])} per share</title></circle>')
         last = ser[-1]
-        out.append(f'<text x="{X(last["date"]) + 9:.1f}" y="{Y(last["value"]) + 4:.1f}" class="val">${last["value"]:,.0f}</text>')
+        out.append(f'<text x="{X(last["date"]) + 9:.1f}" y="{Y(last["value"]) + 4:.1f}" class="val">{model_report.pps(last["value"])}</text>')
         out.append(f'<circle cx="{w - r + 16}" cy="{t + 8 + i * 18}" r="4.5" fill="{col}"/>'
                    f'<text x="{w - r + 26}" y="{t + 12 + i * 18}" class="ax">{esc(hd[:22])}</text>')
     out.append("</svg>")
@@ -893,6 +1162,7 @@ def full_quarter(nq: list[dict]) -> dict:
 
 
 def nport_section(w, rows: list[dict], nq: list[dict], split, short: str) -> None:
+    pps = model_report.pps
     adj_txt = f"adjusted for the {split[1]:g}-for-1 split of {fmt_date(split[0])}" if split else "as filed"
     full = full_quarter(nq)
     w(f'<h3>Quarterly fair-value marks (Form N-PORT)</h3><p class="note">{len(rows):,} positions from {len({r["accession"] for r in rows}):,} filings of '
@@ -905,7 +1175,7 @@ def nport_section(w, rows: list[dict], nq: list[dict], split, short: str) -> Non
       '<th class="n">Low</th><th class="n">High</th></tr>')
     for q in nq:
         w(f"<tr><td>{q['q']}{' (part)' if q is nq[-1] and q is not full else ''}</td><td class='n'>{q['funds']}</td><td class='n'>{money(q['value'])}</td>"
-          f"<td class='n'>${q['median_filed']:,.2f}</td><td class='n'>${q['median_adj']:,.2f}</td><td class='n'>${q['low']:,.2f}</td><td class='n'>${q['high']:,.2f}</td></tr>")
+          f"<td class='n'>{pps(q['median_filed'])}</td><td class='n'>{pps(q['median_adj'])}</td><td class='n'>{pps(q['low'])}</td><td class='n'>{pps(q['high'])}</td></tr>")
     w("</table>")
     now = [r for r in last_per_fund(rows) if r["q"] == full["q"]]
     eq = [r for r in now if r["position_type"] == "equity" and r["filed"]]
@@ -918,7 +1188,7 @@ def nport_section(w, rows: list[dict], nq: list[dict], split, short: str) -> Non
         x = classes[c]
         pr = [r["filed"] for r in x]
         w(f"<tr><td>{esc(c)}</td><td class='n'>{len({r['fund'] for r in x})}</td><td class='n'>{money(sum(r['value'] for r in x))}</td>"
-          f"<td class='n'>${statistics.median(pr):,.2f}</td><td class='n'>${min(pr):,.2f}</td><td class='n'>${max(pr):,.2f}</td></tr>")
+          f"<td class='n'>{pps(statistics.median(pr))}</td><td class='n'>{pps(min(pr))}</td><td class='n'>{pps(max(pr))}</td></tr>")
     w("</table>")
     houses: dict = collections.defaultdict(list)
     for r in eq:
@@ -985,6 +1255,8 @@ def repair_holdings(holdings: list[dict], nport: list[dict], split) -> collectio
     texts: dict = {}
     for h in holdings:
         h["repair"] = ""
+        if from_rows(h):
+            continue
         ev = (h.get("evidence") or "").replace("\u200c", "").strip()
         scale = h.get("value_scale") or 1
         printed = {float(x.replace(",", "")) for x in re.findall(r"\d[\d,]*(?:\.\d+)?", ev)}
@@ -1024,7 +1296,7 @@ def repair_holdings(holdings: list[dict], nport: list[dict], split) -> collectio
 
     dollar_filers: set = set()
     for h in holdings:
-        if h["position_type"] in ("funded_loan", "unfunded_commitment"):
+        if h["position_type"] in ("funded_loan", "unfunded_commitment") or from_rows(h):
             continue
         per_share(h)
         day = as_date(h.get("as_of_date")) or as_date(h.get("filing_date"))
@@ -1058,7 +1330,7 @@ def repair_holdings(holdings: list[dict], nport: list[dict], split) -> collectio
             h["repair"] = (h["repair"] + "; " if h["repair"] else "") + f"per-share value not used: {ratio:.3g}x the N-PORT mark"
             tally["per_share_hidden"] += 1
     for h in holdings:                         # the same printed figure as a row corrected above, so the same unit
-        if (h.get("value_scale") or 1) > 1 and h.get("cost_usd") and not h.get("fair_value_usd") and not h.get("shares") \
+        if (h.get("value_scale") or 1) > 1 and h.get("cost_usd") and not h.get("fair_value_usd") and not h.get("shares") and not from_rows(h) \
                 and (h["filer"], h["cost_usd"] / h["value_scale"]) in dollar_filers:
             h["cost_usd"] /= h["value_scale"]
             h["value_scale"] = 1
@@ -1123,8 +1395,19 @@ def build_html(a, fd: dict, filings: list[dict], holdings: list[dict], facts: li
     P = Placeholders()
     co = fd["company"]
     name = a.name or co["company_name"]
-    short = name.split()[0].rstrip(",")
+    short = getattr(a, "short", "") or short_name(name, {})
     cik_int = int(co["cik"])
+    own = lambda m: str(int(m["filer_cik"])) == str(cik_int) if str(m.get("filer_cik") or "").isdigit() else norm_name(m["filer"]) == norm_name(name)   # noqa: E731
+    others = [m for m in filings if not own(m)]       # filings by other companies and funds (not the company's own Form D)
+    allh, holdings = holdings, [h for h in holdings if h.get("verified", "yes") == "yes"]   # model-only and tier-C numbers feed no figure
+    ev = getattr(a, "evidence", None)
+    unread = getattr(a, "unread", None) or [0, 0]
+    n_ai, n_rev = sum(h.get("source") == AI_ONLY for h in allh), sum(from_rows(h) and h.get("verified") == "no" for h in allh)
+    ev_note = (" No rule-read evidence file (evidence_rows.csv) was found, so holdings amounts are as the language model read them and are not verified." if ev is None else
+               f" Shares, cost, value and dates come from the table rows read by rule (evidence_rows.csv, tier {'/'.join(sorted(a.tiers))}); "
+               f"{n_ai} row(s) only the language model read and {n_rev} evidence row(s) marked for review are left out of every figure and chart (holdings.csv, verified = no)."
+               + (f" {unread[1]} evidence position(s) in {unread[0]} filing(s) the mention step did not prepare are "
+                  + ("added with the filer as holder." if not getattr(a, "only_stems", "") else "left out (pilot run).") if unread[0] else ""))
     today = dt.date.today()
     first_year = fd["year_of_inc"] or min(as_date(o["sale_date"] or o["filing_date"]).year for o in fd["offerings"])
     last_hist = max([as_date(fd["db_until"]).year] + [as_date(m["file_date"]).year for m in filings])
@@ -1162,7 +1445,7 @@ def build_html(a, fd: dict, filings: list[dict], holdings: list[dict], facts: li
     plans = getattr(a, "employee", None) or {}
     fm, cm = getattr(a, "fin", None), getattr(a, "cred", None)
     fm_y = fm["fy"] - 1 if fm else None                       # the calendar year holding most of the modelled fiscal year
-    mu = model_report.usd
+    mu, pps = model_report.usd, model_report.pps
     fc_rows = [r for r in model_report.rows(a.model_out, "credit_projections.csv") if r["scenario"] == "Base"] if fm else []
     us_staff = lambda y: plans.get(y, {}).get("health") or plans.get(y, {}).get("k401")   # noqa: E731
     plan_last = max(plans) if plans else None
@@ -1188,12 +1471,12 @@ def build_html(a, fd: dict, filings: list[dict], holdings: list[dict], facts: li
 <h1>{esc(short)}: financials year by year, {first_year}-{fyears[-1]}</h1><br>
 <h3>SCOPE</h3><p>Funding, ownership, valuation marks, relationships and legal record of {esc(name)} (SEC CIK {esc(co['cik'])}) for
 every year from incorporation in {first_year} to {last_hist}, plus the frame for {fyears[0]}-{fyears[-1]} forecasts. Built from the SEC
-Form D database ({len(fd['filings'])} Form D filings by the company, {len(fd['spvs'])} SPVs) and {len(filings)} SEC filings by other companies and
+Form D database ({len(fd['filings'])} Form D filings by the company, {len(fd['spvs'])} SPVs) and {len(others)} SEC filings by other companies and
 funds that name {esc(short)}{", plus Department of Labor Form 5500 benefit-plan filings" if plans else ""}. {"Revenue, staff, cost, credit and forecast figures are model estimates built from these records and labelled as such; figures that remain unknown" if fm else "Revenue, " + ("global " if plans else "") + "headcount, cost and forecast figures are not in these sources: they"} are shown as placeholders
 (<span class="ph">R1</span> ...) and the forms needed to fill each one are listed in the final sections.</p>
 <h3>DISCLAIMERS</h3><p>{esc(name)} is private and publishes no financial statements. Form D amounts are what the company reported to the
 SEC, not certified cash received. Fund fair values are the funds' own estimates. Relationships and facts were read from the filings by a
-language model (GPT-4.1); every row keeps a verbatim quote that was checked against the filing text.</p>
+language model (GPT-4.1); every row keeps a verbatim quote that was checked against the filing text.{" Holdings amounts come from table rows read by rule; amounts only the model read are not used." if ev is not None else ev_note}</p>
 <p>Not investment advice. Not affiliated with, endorsed by, or prepared with information from {esc(name.rstrip("."))}. Inputs as of
 {fmt_date(fd['db_until'])} (Form D database) and {fmt_date(max(m['file_date'] for m in filings))} (latest filing).</p>
 <p class="muted">Sources: public records - see final section</p></div>""")
@@ -1211,11 +1494,11 @@ language model (GPT-4.1); every row keeps a verbatim quote that was checked agai
 {money(total_raised)} of {'equity and debt' if any_debt else 'equity'} sold to {int(co['total_investors'] or 0)} investors in {len(offs)} offerings,
 the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was "' + esc(rev_ranges[0]) + '" on every filing' if len(rev_ranges) == 1 else 'revenue ranges given: ' + esc(', '.join(rev_ranges) or 'none')}.
 {len(fd['spvs'])} special-purpose vehicles named after {esc(short)} raised a further {money(spv_total)} from {spv_inv} investors to buy its shares.
-""" + (f"On Form N-PORT, funds marked {esc(short)} at a median ${nq[0]['median_adj']:,.2f} per share in {nq[0]['q']} and "
-       f"${full_quarter(nq)['median_adj']:,.2f} in {full_quarter(nq)['q']}{', adjusted for the ' + split_txt if split else ''}; "
+""" + (f"On Form N-PORT, funds marked {esc(short)} at a median {pps(nq[0]['median_adj'])} per share in {nq[0]['q']} and "
+       f"{pps(full_quarter(nq)['median_adj'])} in {full_quarter(nq)['q']}{', adjusted for the ' + split_txt if split else ''}; "
        f"{full_quarter(nq)['funds']} funds reported {money(full_quarter(nq)['value'])} of its shares in that quarter. " if nq else
-       f"Fund holdings put a value of ${first_mark['value']:,.0f} per share on {esc(short)} on {fmt_date(first_mark['date'])} "
-       f"({esc(first_mark['holder'])}, {first_mark['kind']}) and ${last_mark['value']:,.0f} on {fmt_date(last_mark['date'])} "
+       f"Fund holdings put a value of {pps(first_mark['value'])} per share on {esc(short)} on {fmt_date(first_mark['date'])} "
+       f"({esc(first_mark['holder'])}, {first_mark['kind']}) and {pps(last_mark['value'])} on {fmt_date(last_mark['date'])} "
        f"({esc(last_mark['holder'])}). " if pts else "") +
       (f"Its U.S. benefit plans show {us_staff(plan_last):,} active participants at the end of {plan_last}, not total headcount. " if plans else "") +
       (f"Model estimates for FY{fm['fy']}: revenue {mu(fm['rev'])}, EBITDA proxy {mu(fm['ebitda'])}, FCF proxy {mu(fm['fcf'])}, about {round(fm['hc']):,} staff on a {model_report.pct(a.fin['cfg']['us_share'], 0)} U.S. share. "
@@ -1235,7 +1518,7 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
     for y in years + fyears:
         fc = y in fyears
         mk = marks_by_year.get(y)
-        val = (f"${mk['value']:,.0f}/share (fund mark{', split-adjusted' if split else ''}) {P('R4')}" if mk else P("R4"))
+        val = (f"{pps(mk['value'])}/share (fund mark{', split-adjusted' if split else ''}) {P('R4')}" if mk else P("R4"))
         rr = raised.get(y, 0)
         fc_row = next((r for r in fc_rows if r["fiscal_year"] == f"FY{y}"), None) if fc else None
         if fc_row:
@@ -1295,17 +1578,17 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
                              f"{money(h['cost_usd'])} ({esc(h['form'])}, {esc(h['filer'])})")
         for q in nq:
             if q["end"].year == y:
-                items.append(f"{q['q']} (N-PORT): {q['funds']} funds, {money(q['value'])}, median <b>${q['median_adj']:,.2f} per share</b>"
-                             f"{' (filed $' + format(q['median_filed'], ',.2f') + ')' if q['median_filed'] != q['median_adj'] else ''}")
+                items.append(f"{q['q']} (N-PORT): {q['funds']} funds, {money(q['value'])}, median <b>{pps(q['median_adj'])} per share</b>"
+                             f"{' (filed ' + pps(q['median_filed']) + ')' if q['median_filed'] != q['median_adj'] else ''}")
         for p in pts:
             if p["date"].year == y and p["kind"] == "fair value":
                 h = p["src"]
                 if len(items) >= CARD_LINES:
                     more += 1
                     continue
-                was = f", filed ${p['filed']:,.2f}" if abs(p["filed"] - p["value"]) > 0.005 else ""
+                was = f", filed {pps(p['filed'])}" if abs(p["filed"] - p["value"]) > abs(p["value"]) * 0.005 else ""
                 items.append(f"{fmt_date(p['date'])}: {esc(p['holder'])} marks its {num(h['shares'])} shares at {money(h['fair_value_usd'])} "
-                             f"= <b>${p['value']:,.2f} per share</b>{was} ({esc(h['form'])} filed {fmt_date(h['filing_date'])})")
+                             f"= <b>{pps(p['value'])} per share</b>{was} ({esc(h['form'])} filed {fmt_date(h['filing_date'])})")
         if more:
             items.append(f"{more} more purchases and fund marks of the year are in the holdings table.")
         for f in facts_by_year.get(y, []):
@@ -1316,7 +1599,7 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
             if as_date(e["first"]).year == y:
                 items.append(f"First filing that states <b>{esc(e['from'])} {esc(e['relation'].replace('_', ' '))} {esc(e['to'])}</b>: "
                              f"“{esc(e['quote'][:160])}” ({esc(e['form'])} filed {fmt_date(e['first'])})")
-        n_fil = sum(1 for m in filings if as_date(m["file_date"]).year == y)
+        n_fil = sum(1 for m in others if as_date(m["file_date"]).year == y)
         if n_fil:
             items.append(f"{n_fil} filing(s) by other companies or funds name {esc(short)} this year")
         if not items:
@@ -1405,6 +1688,8 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
         w(f"<tr><td><b>Total</b></td><td></td><td class='n'><b>{money(spv_total)}</b></td><td class='n'>{spv_inv}</td></tr></table>")
         w("<p class='note'>SPV money buys existing or new shares through the SPV; it may overlap with the company's own offerings.</p>")
     w('<h3>Fund holdings and valuation marks</h3>')
+    if allh:
+        w(f'<p class="note">Holdings from fund and lender filings: {len(holdings)} row(s) used, {len(allh) - len(holdings)} not verified.{ev_note}</p>')
     if nq:
         nport_section(w, a.nport, nq, split, short)
     loans = [h for h in holdings if h["position_type"] in ("funded_loan", "unfunded_commitment")]
@@ -1417,15 +1702,16 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
         hidden = getattr(a, "repairs", {}).get("per_share_hidden", 0)
         checked = (f" {hits:,} of {pool:,} dated values with a Form N-PORT row for the same fund match it, and {tally.get('other_fund', 0)} more match a row of a fund in the same family; "
                    "rows that do not are marked." + (f" {fixed} rows were corrected, using the filing text and the N-PORT marks, so this is not an independent test. {hidden} per-share values "
-                                                       "more than 3x from the N-PORT mark are shown as hidden (see the repair column of holdings.csv)." if a.repair else " Rows are shown as extracted, so some amounts carry extraction errors.") if tally else "")
+                                                       "more than 3x from the N-PORT mark are shown as hidden (see the repair column of holdings.csv)." if a.repair else " Rows are shown as extracted, so some amounts carry extraction errors." if ev is None else
+                                                       " Amounts are the table rows read by rule; rule repairs do not change them.") if tally else "")
         w(f'<h3>Equity positions in fund filings</h3><p class="note">Per-share values as filed{"; before the " + split_txt + " they are on the old share count" if split else ""}.{checked}</p>')
         w('<table><tr><th>Holder</th><th>Vehicle</th><th>Security</th><th class="n">Shares</th><th class="n">Cost</th><th class="n">Fair value</th>'
           '<th>As of</th><th class="n">Per share</th><th>Source</th></tr>')
         for h in held:
             w(f"<tr><td>{esc(h['holder'])}</td><td>{esc(h['vehicle'])}</td><td>{esc(h['security'])}</td><td class='n'>{num(h.get('shares'))}</td>"
               f"<td class='n'>{money(h.get('cost_usd'))}</td><td class='n'>{money(h.get('fair_value_usd'))}</td>"
-              f"<td>{esc(h.get('as_of_date') or 'not stated')}</td><td class='n'>{'$' + format(h['price_per_share'], ',.2f') if h.get('price_per_share') else ('hidden' if 'not used' in h.get('repair', '') else '—')}</td>"
-              f"<td><a href='{esc(h['sec_url'])}'>{esc(h['form'])}</a> {fmt_date(h['filing_date'])}{repeat(h)}{' <b>differs from N-PORT</b>' if h.get('nport_check', '').startswith('value differs') else ''}</td></tr>")
+              f"<td>{esc(h.get('as_of_date') or 'not stated')}</td><td class='n'>{pps(h['price_per_share']) if h.get('price_per_share') else ('hidden' if 'not used' in h.get('repair', '') else '—')}</td>"
+              f"<td><a href='{esc(h['sec_url'])}'>{esc(h['form'])}</a> {fmt_date(h['filing_date'])}{repeat(h)}{' · tier ' + esc(h['evidence_tier']) if h.get('evidence_tier') else ''}{' <b>differs from N-PORT</b>' if h.get('nport_check', '').startswith('value differs') else ''}</td></tr>")
         w("</table>")
         if loans:
             w('<h3>Loans and unfunded commitments</h3><p class="note">Amounts as read from lender filings, not checked against any outside source. Many lenders print in '
@@ -1517,6 +1803,7 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
       f"<li>Fund fair values are each fund's own estimate at its reporting date; a per-share value is not a company valuation without the share count.</li>"
       f"<li>Relationships and facts were read by GPT-4.1 from {len(filings)} filings (facts step cost ${fx_cost:.2f}); rows whose quote or numbers "
       f"were not found in the filing text, or with confidence below 50, were dropped. Undated table values are kept in the holdings table but not in the per-share series.</li>"
+      f"<li>{ev_note.strip()} The language model is not used to produce holdings numbers.</li>"
       f"<li>The relationship step includes a direction check: the model names the company that does the action and the code flips any edge that "
       f"contradicts it.</li>"
       + (f"<li>The financial and credit models rest on assumptions in model_config: the U.S. share of staff, the peer gross margin and the rating thresholds. A change in these moves the results, as the sensitivity tables show. "
@@ -1564,7 +1851,7 @@ def main() -> int:
     ap.add_argument("company", help="folder name under Targeted_pdf/dumps and prefix in coref_verifier/data, e.g. kalshi")
     ap.add_argument("--cik", required=True, help="the company's own CIK in the Form D database, e.g. 0001806928")
     ap.add_argument("--name", default="", help="display / matching name (default: the Form D company name)")
-    ap.add_argument("--spv-key", default="", help="word that names the company in SPV names (default: first word of the name)")
+    ap.add_argument("--spv-key", default="", help="word that names the company in SPV names (default: model_config company.spv_key, else first word of the name)")
     ap.add_argument("--formd-db", default=str(DEFAULT_DB))
     ap.add_argument("--model", default=c.DEFAULT_MODEL)
     ap.add_argument("--out-dir", default="")
@@ -1582,6 +1869,9 @@ def main() -> int:
     ap.add_argument("--model-data", default="", help="folder with data/ and sources/ for the financial and credit models")
     ap.add_argument("--model-config", default="", help="assumptions file, e.g. model_config/databricks.json")
     ap.add_argument("--split", default="", help="stock split as DATE:RATIO, e.g. 2022-08-08:3 (per-share values before it are divided by RATIO)")
+    ap.add_argument("--evidence-rows", default="", help="table rows read by rule (evidence_build.py); default out/<company>/evidence/evidence_rows.csv. "
+                    "Holdings numbers come from these rows; without the file they stay as the model read them")
+    ap.add_argument("--evidence-tiers", default="A,B", help="evidence tiers whose numbers are used; rows of other tiers are only flagged")
     a = ap.parse_args()
     cik = a.cik.zfill(10)
     out = Path(a.out_dir) if a.out_dir else HERE / "out" / a.company
@@ -1592,7 +1882,11 @@ def main() -> int:
     fd0 = load_formd(Path(a.formd_db), cik, "")
     name = a.name or fd0["company"]["company_name"]
     a.name = name
-    spv_key = a.spv_key or norm_name(name).split()[0]
+    if a.model_config and not Path(a.model_config).exists():
+        raise SystemExit(f"--model-config {a.model_config}: no such file")
+    a.cfg = json.loads(Path(a.model_config).read_text(encoding="utf-8")) if a.model_config else {}
+    a.short = short_name(name, a.cfg)
+    spv_key = a.spv_key or (a.cfg.get("company") or {}).get("spv_key") or norm_name(name).split()[0]
     fd = load_formd(Path(a.formd_db), cik, spv_key)
     print(f"   {name}: {len(fd['filings'])} filings, {len(fd['offerings'])} offerings, {money(fd['company']['total_raised'])} sold, "
           f"{len(fd['people'])} people, {len(fd['spvs'])} SPVs ('{spv_key}')")
@@ -1615,15 +1909,23 @@ def main() -> int:
             per_filing[m["stem"]] = res
 
     print("5. Merge")
-    holdings, facts = merge(filings, per_filing)
-    print(f"   {len(holdings)} distinct holding rows, {len(facts)} distinct facts, {len(edges)} relationships involving {name}")
+    ev_path = Path(a.evidence_rows) if a.evidence_rows else HERE / "out" / a.company / "evidence" / "evidence_rows.csv"   # where evidence_build.py writes, whatever --out-dir
+    a.tiers = {x.strip()[:1].upper() for x in a.evidence_tiers.split(",") if x.strip()}
+    a.evidence = load_evidence(ev_path)
+    print(f"   evidence rows: {'MISSING ' + str(ev_path) + ' - holdings numbers stay as the model read them' if a.evidence is None else str(sum(map(len, a.evidence.values()))) + ' positions in ' + str(len(a.evidence)) + ' filings'}")
+    holdings, facts = merge(filings, per_filing, a.evidence, a.tiers, name, add_unread=only is None)
+    a.unread = merge.unread
+    if a.unread[0]:
+        print(f"   {a.unread[1]} evidence positions in {a.unread[0]} filings the mention step did not prepare: {'added' if only is None else 'left out (pilot)'}")
+    edges = holder_edges(edges, holdings, name)
+    print(f"   {len(holdings)} distinct holding rows ({collections.Counter(h['source'].split(';')[0].split(',')[0] for h in holdings)}), {len(facts)} distinct facts, {len(edges)} relationships involving {name}")
 
     a.nport = load_nport(a.nport_csv, parse_split(a.split)) if a.nport_csv else []
-    a.employee = load_employee(a.employee_dir, a.employee_company or a.name.split()[0].rstrip(",")) if a.employee_dir else {}
+    a.employee = load_employee(a.employee_dir, a.employee_company or a.short) if a.employee_dir else {}
     a.fin = a.cred = None
     if a.model_data:
         a.model_data, a.model_out = Path(a.model_data), out / "model"
-        cfg = json.loads(Path(a.model_config).read_text(encoding="utf-8"))
+        cfg = a.cfg
         a.fin = model_financials.Model(a.model_data, cfg).run()
         model_financials.save(a.fin, a.model_out)
         a.cred = model_credit.run(a.model_data, a.model_out, cfg, a.model_out)
@@ -1638,10 +1940,11 @@ def main() -> int:
     html_path = out / f"{stem}.html"
     html_path.write_text(doc, encoding="utf-8")
     write_csv(out / "formd_offerings.csv", fd["offerings"], list(fd["offerings"][0].keys()) if fd["offerings"] else [])
-    write_csv(out / "holdings.csv", holdings, ["holder", "vehicle", "position_type", "security", "shares", "cost_usd", "fair_value_usd",
+    write_csv(out / "holdings.csv", holdings, ["holder", "vehicle", "position_type", "security", "verified", "source", "shares", "cost_usd", "fair_value_usd",
                                                 "commitment_usd", "shared_with", "value_scale", "shares_scale", "price_per_share",
                                                 "cost_per_share", "pct_net_assets", "acquisition_date", "as_of_date", "form", "filer",
-                                                "filing_date", "sources", "page", "evidence", "confidence", "sec_url", "nport_check", "repair"])
+                                                "filing_date", "sources", "accessions", "first_filing_date", "page", "evidence_tier", "evidence_row",
+                                                "ai_values", "ai_as_of_date", "evidence", "confidence", "sec_url", "nport_check", "repair"])
     if a.nport:
         write_csv(out / "nport_holdings.csv", a.nport, [k for k in a.nport[0] if k not in ("date", "value", "filed", "q", "fund")])
     write_csv(out / "facts.csv", facts, ["as_of_date", "metric", "value_number", "unit", "value_text", "form", "filer", "filing_date",

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import html
+import math
 from pathlib import Path
 
 _e = lambda x: html.escape(str(x))                                                                  # noqa: E731
@@ -20,6 +21,18 @@ def usd(v, d=2):
     if a >= 1e3:
         return f"{s}${a / 1e3:,.0f}K"
     return f"{s}${a:,.0f}"
+
+
+def pps(v, dash="—"):
+    """A per-share value: cents from $1 up, three significant figures below (a $0.0009 mark is not $0.00)."""
+    if v in (None, ""):
+        return dash
+    v = float(v)
+    s, a = ("−" if v < 0 else ""), abs(v)
+    if a >= 1 or a == 0:
+        return f"{s}${a:,.2f}" if a else "$0"
+    whole, frac = f"{a:.{2 - math.floor(math.log10(a))}f}".split(".")
+    return f"{s}${whole}.{frac.rstrip('0').ljust(2, '0')}"
 
 
 def pct(v, d=1):
@@ -89,15 +102,15 @@ def financial_section(w, f: dict, data: Path, svg, short: str) -> None:
     table(w, ["FY", "Financing", "Business combination", "Offerings"], [[f"FY{y}", usd(v[0]), usd(v[1]), v[2]] for y, v in fund] +
           [["Total", usd(sum(v[0] for _, v in fund)), usd(sum(v[1] for _, v in fund)), sum(v[2] for _, v in fund)]])
     w("<h3>Valuation</h3>")
-    table(w, ["Item", "Value"], [*[[f"Series {s} cost per share", f"${v:.2f}"] for s, v in zip(c["series_recent"], (f["px_j"], f["px_k"])) if v], ["Latest round price", f"${f['px_l']:.2f}"], ["Latest round valuation", usd(f["val"], 0)],
+    table(w, ["Item", "Value"], [*[[f"Series {s} cost per share", pps(v)] for s, v in zip(c["series_recent"], (f["px_j"], f["px_k"])) if v], ["Latest round price", pps(f["px_l"])], ["Latest round valuation", usd(f["val"], 0)],
                                  ["Implied shares (model)", f"{round(f['shares']):,}"], ["Valuation / run-rate at the round (model)", f"{f['mult_round']:.2f}x"], ["Valuation / fitted run-rate at fiscal year end (model)", f"{f['mult_end']:.2f}x"],
-                                 [f"Median N-PORT mark, {f['mark']['month']}", f"${float(f['mark']['median_price']):.2f}"], ["Implied value at that mark (model)", usd(f["implied"], 1)], ["Highest fund mark, latest month", f"${f['ark']:.2f}"],
+                                 [f"Median N-PORT mark, {f['mark']['month']}", pps(f["mark"]["median_price"])], ["Implied value at that mark (model)", usd(f["implied"], 1)], ["Highest fund mark, latest month", pps(f["ark"])],
                                  ["Implied value at that highest mark (model)", usd(f["implied_ark"], 1)]])
     w("<h3>Revenue multiples used by funds (Level 3 disclosures)</h3>")
     table(w, ["Date", "Filer", "Low", "High", "Central"], [[r["valuation_date"], r["filer"], f"{r['low']}x", f"{r['high']}x", f"{r['central']}x" if r["central"] else "—"] for r in rows(D, "revenue_multiples.csv")], num_from=2)
     w("<h3>Monthly fund marks (Form N-PORT, last 12 months)</h3>")
     pm = rows(D, "nport_price_monthly.csv")[-12:]
-    table(w, ["Month", "Funds", "Median", "Low", "High"], [[p["month"], p["funds"], f"${float(p['median_price']):.2f}", f"${float(p['min_price']):.2f}", f"${float(p['max_price']):.2f}"] for p in pm])
+    table(w, ["Month", "Funds", "Median", "Low", "High"], [[p["month"], p["funds"], pps(p["median_price"]), pps(p["min_price"]), pps(p["max_price"])] for p in pm])
     w("<h3>Year by year (fiscal years)</h3>")
     table(w, ["FY", "Revenue", "Form D", "Bus. comb.", "Visible debt", "Health plan", "Global", "U.K. staff", "U.K. $/emp", "401(k)", "H-1B", "Federal"],
           [[f"FY{r['fy']}", usd(r["revenue"]), usd(r["form_d"]), usd(r["form_d_bc"]), "—" if r["debt_10k"] is None else usd(r["debt_10k"] + r["debt_np"]), r["health"] or "—", r["global_"] or "—", r["uk_staff"] or "—",
@@ -165,7 +178,7 @@ def market_section(w, f: dict, r: dict, data: Path, short: str) -> None:
     table(w, ["Metric", "Value", "Basis"], [
         ["Revenue run-rate", usd(fig["rr_last"]["value"], 1), f"{fig['rr_last']['form']}, {fig['rr_last']['filer']}"], ["Run-rate growth", f"more than {pct(fig['growth']['value'], 0)}", fig["growth"]["form"]],
         *([["AI products run-rate", "more than " + usd(fig["ai_rr"]["value"], 1), fig["ai_rr"]["form"]]] if "ai_rr" in fig else []),
-        [f"Revenue, FY{f['fy']}", f"{usd(f['rev'])} (range {usd(f['low'])} to {usd(f['high'])})", "model"], ["Valuation", usd(f["val"], 0), fig["valuation"]["form"]], ["Latest round price", f"${f['px_l']:.0f} a share", fig["price"]["form"]],
+        [f"Revenue, FY{f['fy']}", f"{usd(f['rev'])} (range {usd(f['low'])} to {usd(f['high'])})", "model"], ["Valuation", usd(f["val"], 0), fig["valuation"]["form"]], ["Latest round price", f"{pps(f['px_l'])} a share", fig["price"]["form"]],
         ["Fund exposure, latest reports", f"{usd(sum(float(x['value_usd']) for x in h))} across {len(h)} funds", "Form N-PORT"], ["Debt visible", f"{usd(f['debt'])} funded; about {usd(f['capacity'], 0)} more capacity", "10-K, N-PORT, N-CSRS"], ["Credit", f"synthetic {r['rating']}; 1-year PD {pct(r['pds'][0]['r'], 2)}", "model"],
         ["U.S. health plan", f"{f['health_last']:,} active participants", "Form 5500"], [f"Federal obligations (FPDS)", f"{usd(sum(float(x['obligated_usd'] or 0) for x in fed))} on {len(fed)} actions", "FPDS"], ["Federal awards naming the company", f"{usd(sum(float(x['award_amount_usd'] or 0) for x in us), 1)} on {len(us)} awards", "USAspending"],
         ["FedRAMP", f"{len(fr)} authorised offerings, {sum(x['impact_level'] == 'High' for x in fr)} at High", "FedRAMP"]], num_from=9)
@@ -185,7 +198,7 @@ def market_section(w, f: dict, r: dict, data: Path, short: str) -> None:
     table(w, ["Date", "Statement", "Words in the filing"], [[x["as_of"], x["statement"], x["quote"][:160]] for x in rows(D, "acquisitions.csv")], num_from=9)
     w("<h3>Prices paid in fund filings</h3>")
     lots = sorted(rows(D, "dated_lots.csv"), key=lambda x: (-int(x["rows"]), x["acquired"]))[:24]
-    table(w, ["Acquired", "Series", "Per share, split-adjusted", "Shares", "Cost", "Holder"], [[x["acquired"], x["series"], f"${float(x['cost_per_share_split_adj']):.2f}", f"{float(x['shares']):,.0f}", usd(x["cost_usd"]), x["holder"][:40]] for x in sorted(lots, key=lambda x: x["acquired"])], num_from=2)
+    table(w, ["Acquired", "Series", "Per share, split-adjusted", "Shares", "Cost", "Holder"], [[x["acquired"], x["series"], pps(x["cost_per_share_split_adj"]), f"{float(x['shares']):,.0f}", usd(x["cost_usd"]), x["holder"][:40]] for x in sorted(lots, key=lambda x: x["acquired"])], num_from=2)
     w("<h3>Largest current holders (Form N-PORT)</h3>")
     table(w, ["House", "Fund", "Report date", "Value", "% NAV", "Exposure"], [[x["fund_house"], x["fund"][:44], x["report_date"], usd(x["value_usd"]), f"{float(x['pct_net_assets']):.2f}%", x["exposure"]] for x in h[:15]], num_from=3)
     w("<h3>Holdings through vehicles</h3>")
@@ -203,7 +216,7 @@ def market_section(w, f: dict, r: dict, data: Path, short: str) -> None:
     w(f'<h3>Who is buying and selling</h3><p class="note">Net value of shares added less shares cut each quarter, at the funds own marks. Total {usd(sum(float(x["net_buying_usd"]) for x in fl))}. Fund mergers and share-class moves look like trades.</p>')
     table(w, ["Quarter", "Net buying"], [[x["quarter"], usd(x["net_buying_usd"])] for x in sorted(fl, key=lambda x: -float(x["net_buying_usd"]))[:6]])
     w("<h3>Price levels</h3>")
-    table(w, ["Mark (split-adjusted)", "First month", "Last month", "Months as most common mark"], [[f"${float(x['price']):.2f}", x["first_month"], x["last_month"], x["months"]] for x in rows(D, "price_levels.csv")])
+    table(w, ["Mark (split-adjusted)", "First month", "Last month", "Months as most common mark"], [[pps(x["price"]), x["first_month"], x["last_month"], x["months"]] for x in rows(D, "price_levels.csv")])
     wp = data / "data" / "welfare_plans.csv"
     if wp.exists():
         table(w, ["Plan year", "Severance plan, active at year end"], [[x["plan_year"], x["active_participants_eoy"]] for x in rows(D, "welfare_plans.csv") if x["plan_kind"] == "Severance"])
