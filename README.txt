@@ -140,6 +140,77 @@ company-finder/company_finder.py  (+ package company_finder/)
     sec.py          SEC/EDGAR helpers: filing sections, SGML submissions, Form D fields
     config.py       defaults (stop words, legal suffixes); data/common_words.txt is its word list
 
+PIPELINE TOOLS AND THE ONE-COMMAND RUN (tools/, run_company.py)
+---------------------------------------------------------------
+Every tool reads the company from coref_experiment/company_report/model_config/<co>.json ("name", company.cik,
+company.aliases, company.name_regex; optional "dump_folders"). Nothing in them is specific to one company.
+SEC asks every client to name itself; the SEC tools and nport.py stop with an error when this is not set:
+  export SEC_USER_AGENT="your-org contact@your-domain"
+All SEC access is at most 5 requests/s, with retries. <root> below is the folder that holds dumps/ and input/.
+
+tools/download_filings.py <co> [--term "..."] [--skip-forms NPORT-P,NPORT-P/A] [--dumps DIR] [--list-only]
+  Step 0. EDGAR full-text search (2001 on, all forms) for the config name + aliases (+ --term). Ranges over the
+  search's 10,000-hit cap are split by date. Hits of --skip-forms are listed but not downloaded (default: N-PORT,
+  which nport.py reads as XML; pass --skip-forms "" to keep all). Resumable: files on disk are kept.
+  With --only-terms (search just the --term phrases) the new rows are merged into the existing manifest and hit list,
+  so a run for one extra phrase keeps the filings found before. Both files are written atomically.
+  Output: <dumps>/<co>/<form>/<accession>_<file>, <dumps>/<co>_manifest.csv
+          (file,form,file_date,accession,filer,sec_url,index_url,status), <dumps>/<co>_fts_hits.csv (every hit, terms)
+
+coref_experiment/company_report/nport.py
+  list / download / parse   N-PORT XML from EDGAR (needs SEC_USER_AGENT; TLS via certifi)
+  export-db TERM --dump DIR --db nport_team.duckdb --config model_config/<co>.json [--match-title]
+                            team database rows whose ISSUER_NAME matches (^|\W)(name_regex)(\W|$) -> DIR/duckdb_rows.csv
+                            (whole words, so "get heal" does not match "TARGET HEALTHCARE"). Stops with exit 1 when
+                            no row matches, and when name_regex is not RE2-compatible (DuckDB: no lookarounds).
+  build TERM --dump DIR --config model_config/<co>.json --out DIR/nport_holdings.csv
+                            database rows first, XML rows (DIR/nport_rows.csv) for filings the database lacks; either
+                            file may be absent, not both. A row is the company's own equity when its issuer name starts
+                            with name_regex; a vehicle named after it is spv_interest.
+  Name pattern (parse, export-db, build): company.name_regex of --config; without --config, model_config/<co>.json
+  with <co> from a DIR named <co>_nport or from the TERM's words; else the TERM's words with any punctuation between
+  them ("Get Heal, Inc." also matches "GET HEAL INC"). The pattern used is printed.
+  Usual order: export-db "<Name>" --dump <root>/dumps/<co>_nport --db ... --config model_config/<co>.json ;
+               build "<Name>" --dump <root>/dumps/<co>_nport --config model_config/<co>.json
+               --out <root>/dumps/<co>_nport/nport_holdings.csv
+
+tools/build_formd_db.py <co> [--xml-dir DIR ...] [--out PATH] [--no-fetch] [--force]
+  Only when the team's formd.duckdb is missing. Builds the same tables (companies, filings, related_persons,
+  offerings) from Form D XML: the company's own D and D/A notices (listed from its EDGAR filing index, missing ones
+  downloaded into the first --xml-dir), plus any other issuer's notice in --xml-dir (an SPV naming the company;
+  category 'fund' when it says Pooled Investment Fund). Filing date and file number come from the EDGAR index. An
+  amendment restates its offering, so offering and company totals use the latest notice per file number.
+  Default --xml-dir: <root>/dumps/<co>/D and D-A; default --out: <root>/input/formd/formd.duckdb (never overwritten
+  without --force). Stops before writing when no parsed notice is the company's own (CIK from the config).
+
+tools/build_context_windows.py <co> [--folders ...] [--dumps DIR] [--context 50] [--out FILE.xlsx]
+  Workbook for evidence_recall.py: sheet "Windows" (Window ID, Form, Filing date, Company (filer), Accession number,
+  File name, Mention lines, Line range, LLM input (metadata + window text)). Up to --context lines (paragraphs, table
+  rows, PDF lines) either side of each match of company.name_regex; mention lines start with >>> and the name is in
+  « ». HTML/XML whitespace is collapsed before lines are cut at block tags, so a name wrapped in the source
+  ("Get\n Heal Inc.") is one line; in plain text and PDF a name cut over two lines joins them. A window longer than an
+  Excel cell is cut with less context; a single line longer than a cell is cut around its first mention.
+
+coref_experiment/company_report/run_company.py <co> --cik CIK --name "..." [options]
+  1. input tables (skip with --skip-inputs)   2. evidence by rule: evidence_tables.py --folders <dump folders>
+  --workers N, then evidence_build.py (skip with --no-evidence)   3. build_report.py --evidence-rows
+  out/<co>/evidence/evidence_rows.csv   4. with --context-windows FILE: evidence_recall.py and evidence_workbook.py
+  (workbooks in out/<co>/evidence/).
+  Dump folders: --folders, else config "dump_folders", else <co> plus every <co>_<word> with a manifest
+  (e.g. <co>_ncsr, <co>_delta). An extra folder goes to build_report.py only if it has a company-finder mentions run
+  (prepared filings, or a Targeted_pdf mentions csv plus Targeted_pdf/dumps/<f>_manifest.csv); otherwise it is used by
+  the evidence steps only and listed under "not built". A requested folder without a manifest is listed there too.
+  A config key a step needs but the company lacks (peers, k401_plan ...) is listed as "not configured" at the end.
+
+New company, in order:
+  tools/download_filings.py <co>                     -> dumps/<co>, dumps/<co>_manifest.csv
+  nport.py export-db + build                          -> dumps/<co>_nport/nport_holdings.csv
+  company_finder.py ... ; prepare_targeted.py <co>    (see "Typical order" above)
+  tools/build_formd_db.py <co>                        only without the team's formd.duckdb
+  tools/build_context_windows.py <co> --out <file>
+  run_company.py <co> --cik ... --name ... --nport-db ... --context-windows <file>
+
+
 NOTES
 -----
 - Paths inside the scripts are relative to the folder layout above. Keep it as is.

@@ -4,16 +4,35 @@
   nport.py list     COMPANY_TERM --dump DIR     EDGAR full-text search -> DIR/manifest.csv
   nport.py download --dump DIR                  fetches each primary_doc.xml (gzipped), resumes, ~5 requests/s
   nport.py parse    COMPANY_TERM --dump DIR --out FILE.csv     one row per position that names the company
+  nport.py export-db COMPANY_TERM --dump DIR --db nport_team.duckdb [--config model_config/<co>.json]
+                                                team database rows whose issuer name matches -> DIR/duckdb_rows.csv
   nport.py build    COMPANY_TERM --dump DIR --out FILE.csv     merged, amendments applied, classified (input to build_report --nport-csv)
+The company's name pattern is company.name_regex of --config (default: model_config/<co>.json, <co> from a DIR named
+<co>_nport or from the term's words), else the term's words; parse, export-db and build all use it.
+SEC requests need a contact: export SEC_USER_AGENT="your-org contact@your-domain".
 """
-import argparse, collections, csv, datetime as dt, gzip, json, re, sys, threading, time, urllib.parse, urllib.request
+import argparse, collections, csv, datetime as dt, gzip, json, os, re, ssl, sys, threading, time, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-UA = {"User-Agent": "projectx-filings-research testable485@gmail.com"}
+UA = {}
+CONFIG = Path(__file__).resolve().parent / "model_config"
 FORMS = ["NPORT-P", "NPORT-P/A"]
 _lock, _next = threading.Lock(), [0.0]
+
+
+def sec_setup():
+    """SEC asks every client to name itself; urllib verifies TLS with certifi's roots (the system store fails on some Macs)."""
+    ua = os.environ.get("SEC_USER_AGENT", "").strip()
+    if not ua:
+        sys.exit('SEC_USER_AGENT is not set. SEC requires a contact in every request, e.g.\n  export SEC_USER_AGENT="your-org contact@your-domain"')
+    UA["User-Agent"] = ua
+    try:
+        import certifi
+        UA["_ctx"] = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        UA["_ctx"] = ssl.create_default_context()
 
 
 def get(url: str, tries: int = 6) -> bytes:
@@ -24,7 +43,7 @@ def get(url: str, tries: int = 6) -> bytes:
         if wait > 0:
             time.sleep(wait)
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA["User-Agent"]}), timeout=60, context=UA["_ctx"]) as r:
                 return r.read()
         except Exception as e:
             if i == tries - 1:
@@ -42,6 +61,7 @@ def windows():
 
 
 def cmd_list(a):
+    sec_setup()
     dump = Path(a.dump); dump.mkdir(parents=True, exist_ok=True)
     seen = {}
     for form in FORMS:
@@ -76,6 +96,7 @@ def sec_url(r): return f"https://www.sec.gov/Archives/edgar/data/{r['cik']}/{r['
 
 
 def cmd_download(a):
+    sec_setup()
     dump = Path(a.dump); xml = dump / "xml"; xml.mkdir(exist_ok=True)
     rows = list(csv.DictReader(open(dump / "manifest.csv")))
     if a.limit:
@@ -148,7 +169,7 @@ def parse_one(r, xml: Path, pat):
 
 def cmd_parse(a):
     dump = Path(a.dump); xml = dump / "xml"
-    pat = re.compile(re.escape(a.term), re.I)
+    pat = re.compile(edged(name_regex(a)))
     rows, none, missing = [], 0, 0
     for r in csv.DictReader(open(dump / "manifest.csv")):
         if not (xml / f"{r['accession']}.xml.gz").exists():
@@ -168,12 +189,12 @@ OUT = ["report_date", "filing_date", "form", "accession", "fund_house", "registr
        "fund_net_assets", "asset_cat", "fair_value_level", "restricted", "source", "sec_url"]
 
 
-def position(name: str, title: str, cat: str, unit: str, term: str) -> str:
+def position(name: str, title: str, cat: str, unit: str, issuer) -> str:
+    """issuer: compiled pattern that matches a name starting with the company's own name (not a vehicle named after it)."""
     text = f"{name} {title}".upper()
-    t = term.upper()
     if cat == "LON" or unit == "PA":
         return "funded_loan"
-    if not (name.upper().startswith(t) or (name in ("", "N/A") and title.upper().startswith(t))):
+    if not (issuer.match(name) or (name in ("", "N/A") and issuer.match(title))):
         return "spv_interest"                            # a vehicle that holds the company, its value is not a share price
     return "equity" if unit == "NS" and cat in ("EP", "EC") and "WARRANT" not in text else "other"
 
@@ -189,9 +210,13 @@ def cmd_build(a):
     """Team database rows first; XML rows only for filings the database does not have. A later filing of the same fund and
     date (an amendment) replaces the earlier one."""
     dump = Path(a.dump)
+    db_rows, xml_rows = dump / "duckdb_rows.csv", dump / "nport_rows.csv"   # export-db output / parse output; either may be absent
+    if not db_rows.exists() and not xml_rows.exists():
+        sys.exit(f"build: neither {db_rows} (export-db) nor {xml_rows} (parse) exists")
+    issuer = re.compile(rf"(?i)\W*(?:{name_regex(a)})(?:\W|$)")
     rows = []
     houses = {}
-    for r in csv.DictReader(open(dump / "duckdb_rows.csv")):
+    for r in (csv.DictReader(open(db_rows)) if db_rows.exists() else []):
         houses[r["series_id"]] = r["fund_house"]
         cik = str(int(r["cik"]))
         rows.append(dict(report_date=r["report_date"], filing_date=r["filing_date"], form=r["sub_type"], accession=r["ACCESSION_NUMBER"],
@@ -200,7 +225,7 @@ def cmd_build(a):
                          pct_net_assets=r["PERCENTAGE"], fund_net_assets=r["fund_net_assets"], asset_cat=r["ASSET_CAT"],
                          fair_value_level=r["FAIR_VALUE_LEVEL"], restricted=r["IS_RESTRICTED_SECURITY"], source="team database"))
     have = {r["accession"] for r in rows}
-    for r in csv.DictReader(open(dump / "nport_rows.csv")):
+    for r in (csv.DictReader(open(xml_rows)) if xml_rows.exists() else []):
         if r["accession"] in have:
             continue
         rows.append(dict(report_date=r["period"], filing_date=r["file_date"], form=r["form"], accession=r["accession"],
@@ -220,7 +245,7 @@ def cmd_build(a):
             dropped += 1
             continue
         bal, val = float(r["balance"] or 0), float(r["value_usd"] or 0)
-        pos = position(r["name"], r["title"], r["asset_cat"], r["unit"], a.term)
+        pos = position(r["name"], r["title"], r["asset_cat"], r["unit"], issuer)
         r.update(position_type=pos, share_class=share_class(r["name"], r["title"], r["asset_cat"]) if pos == "equity" else "",
                  shares=r["balance"] if pos == "equity" else "", par_or_units="" if pos == "equity" else r["balance"],
                  filed_price_per_share=round(val / bal, 4) if pos == "equity" and bal else "",
@@ -232,12 +257,67 @@ def cmd_build(a):
     print(len(rows), "rows,", dropped, "replaced by an amendment,", len(kept), "kept:", collections.Counter(r["position_type"] for r in kept).most_common())
 
 
+DB_COLS = ["series_id", "fund_house", "cik", "report_date", "filing_date", "sub_type", "ACCESSION_NUMBER", "registrant_name", "series_name",
+           "ISSUER_NAME", "ISSUER_TITLE", "BALANCE", "UNIT", "CURRENCY_VALUE", "PERCENTAGE", "fund_net_assets", "ASSET_CAT",
+           "FAIR_VALUE_LEVEL", "IS_RESTRICTED_SECURITY"]
+
+
+def config_path(a) -> Path | None:
+    """--config, else model_config/<co>.json with <co> from a dump folder named <co>_nport or from the term's words."""
+    if a.config:
+        if not Path(a.config).exists():
+            sys.exit(f"--config: {a.config} not found")
+        return Path(a.config)
+    cands = [re.sub(r"_nport$", "", Path(a.dump).resolve().name), "_".join(re.findall(r"\w+", a.term.lower()))]
+    return next((CONFIG / f"{c}.json" for c in cands if (CONFIG / f"{c}.json").exists()), None)
+
+
+def name_regex(a) -> str:
+    """Company name pattern: config company.name_regex, else the term's words with any punctuation or space between them
+    ("Get Heal, Inc." -> Get, Heal, Inc joined by \\W+, which also matches 'GET HEAL INC')."""
+    p = config_path(a)
+    rx = json.loads(p.read_text(encoding="utf-8")).get("company", {}).get("name_regex", "") if p else ""
+    if not getattr(a, "_said", False):
+        print("name pattern from", f"{p} company.name_regex" if rx else f"the term {a.term!r} (no config name_regex)", file=sys.stderr)
+        a._said = True
+    return rx or r"\W+".join(re.escape(w) for w in re.findall(r"\w+", a.term))
+
+
+def edged(rx: str) -> str:
+    """Whole-word match that also works after punctuation ('Inc.') and in DuckDB's RE2 (a word boundary fails after a non-word character at the end)."""
+    return rf"(?i)(?:^|\W)(?:{rx})(?:\W|$)"
+
+
+def cmd_export_db(a):
+    """Team database -> DIR/duckdb_rows.csv, the input `build` reads first. Matches the issuer name (and title with --match-title)."""
+    import duckdb
+    if not a.db or not Path(a.db).exists():
+        sys.exit(f"--db: N-PORT team database not found: {a.db!r}")
+    dump = Path(a.dump); dump.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(a.db, read_only=True, config={"enable_external_access": False, "autoload_known_extensions": False, "autoinstall_known_extensions": False})
+    pat = edged(name_regex(a))
+    where = "regexp_matches(ISSUER_NAME, ?)" + (" OR regexp_matches(coalesce(ISSUER_TITLE, ''), ?)" if a.match_title else "")
+    try:
+        rows = con.execute(f"SELECT {', '.join(DB_COLS)} FROM holdings WHERE {where} ORDER BY report_date, series_id, ACCESSION_NUMBER",
+                           [pat] * (2 if a.match_title else 1)).fetchall()
+    except duckdb.InvalidInputException as e:      # DuckDB uses RE2: no lookahead, lookbehind or backreference
+        sys.exit(f"export-db: pattern {pat!r} is not RE2-compatible; company.name_regex must avoid lookarounds and backreferences ({e})")
+    if not rows:                                   # an empty file would only show up later as a report without N-PORT
+        sys.exit(f"export-db: 0 holdings whose issuer name matches {pat!r}; check company.name_regex or pass --config")
+    with open(dump / "duckdb_rows.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(DB_COLS); w.writerows(rows)
+    print(len(rows), "rows; pattern", pat, "; issuer names:", collections.Counter(r[9] for r in rows).most_common(12))
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["list", "download", "parse", "build"])
+    ap.add_argument("cmd", choices=["list", "download", "parse", "build", "export-db"])
     ap.add_argument("term", nargs="?", default="Databricks")
     ap.add_argument("--dump", required=True)
     ap.add_argument("--out", default="nport.csv")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--db", default="", help="export-db: the team N-PORT database (table holdings)")
+    ap.add_argument("--config", default="", help="model_config/<co>.json; its company.name_regex is the name pattern (default: found from DIR or the term)")
+    ap.add_argument("--match-title", action="store_true", help="export-db: also match ISSUER_TITLE (an SPV named after the company)")
     a = ap.parse_args()
-    {"list": cmd_list, "download": cmd_download, "parse": cmd_parse, "build": cmd_build}[a.cmd](a)
+    {"list": cmd_list, "download": cmd_download, "parse": cmd_parse, "build": cmd_build, "export-db": cmd_export_db}[a.cmd](a)
