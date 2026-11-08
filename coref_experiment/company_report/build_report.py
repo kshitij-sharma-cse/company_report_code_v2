@@ -1364,7 +1364,7 @@ def nport_check(holdings: list[dict], rows: list[dict]) -> collections.Counter:
     for r in rows:
         if r["position_type"] == "equity":
             by_day[r["report_date"]].append(r)
-    near = lambda x, y: abs(x - y) <= max(1.5, abs(y) * 0.002)                                     # noqa: E731
+    near = lambda x, y, half=0.0: abs(x - y) <= max(1.5, abs(y) * 0.002, half)                       # noqa: E731
     tally: collections.Counter = collections.Counter()
     for h in holdings:
         h["nport_check"] = ""
@@ -1375,9 +1375,10 @@ def nport_check(holdings: list[dict], rows: list[dict]) -> collections.Counter:
         same = [r for r in day if name and len(name & words(f"{r['series']} {r['registrant']}")) >= max(1, len(name) - 1)]
         values = [r["value"] for r in same]
         fv = float(h["fair_value_usd"])
+        half = float(h.get("value_scale") or 1) / 2   # a value printed in thousands is only known to within half a unit
         family = next(iter(re.findall(r"[a-z0-9]+", (h.get("filer") or "").lower())), "")
         tally["same_fund_rows"] += 1 if same else 0
-        if any(near(fv, v) for v in values + ([sum(values)] if values else [])):
+        if any(near(fv, v, half) for v in values + ([sum(values)] if values else [])):
             h["nport_check"], key = "value matches", "match"
         elif fv >= 50000 and any(near(fv, r["value"]) and family in words(f"{r['series']} {r['registrant']}") for r in day):
             # a trust files one report for many funds, so the name often differs. Same family and not a tiny amount, which would match by chance.

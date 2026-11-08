@@ -1,0 +1,17 @@
+{
+ "as_of": "2026-11-08",
+ "fy_end_month": 12,
+ "name": "Outreach Corp",
+ "company": {
+  "cik": "0001537182",
+  "match": "OUTREACH CORP",
+  "name_regex": "outreach\\s+corp(?:oration)?|componentlab",
+  "aliases": [
+   "Outreach Corp",
+   "Outreach Corporation",
+   "ComponentLab"
+  ],
+  "employee_company": "Outreach",
+  "spv_key": "outreach"
+ }
+}

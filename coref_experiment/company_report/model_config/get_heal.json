@@ -1,0 +1,17 @@
+{
+ "as_of": "2026-11-08",
+ "fy_end_month": 12,
+ "name": "Get Heal",
+ "company": {
+  "cik": "0001687019",
+  "match": "GET HEAL",
+  "name_regex": "get ?heal",
+  "aliases": [
+   "Get Heal",
+   "Heal, Inc.",
+   "Burrito Labs"
+  ],
+  "employee_company": "Get Heal",
+  "spv_key": "heal"
+ }
+}
