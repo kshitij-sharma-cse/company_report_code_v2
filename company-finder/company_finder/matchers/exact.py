@@ -1,9 +1,10 @@
 """Aho-Corasick exact/alias matcher with word boundaries and longest-match."""
 from __future__ import annotations
 
+import logging
 import re
 
-from ..config import Config
+from ..config import DEFAULT_NAME_TAIL_SKIP_WORDS, Config
 from ..dedupe import company_matches_surface, legal_form, surface_form
 from ..loader import Company
 from ..mention import Mention
@@ -11,12 +12,15 @@ from ..normalise import NormalizedText
 from ..variants import CAPITALISED, EXACT, TICKER, AliasSpec
 from .base import BaseMatcher, MatchContext
 
+log = logging.getLogger(__name__)
+
 BLOCK = -1
 _SENT_END_CHARS = set(".!?:\"'\u2022*\u00b7\u25aa")
 _EXT_GAP_FIRST = re.compile(r"[ \t,]*")
 _EXT_GAP_NEXT = re.compile(r"[ \t,.]*")
 _TICKER_GAP = re.compile(r"\s*[:\-\u2013]?\s*")
 _ROMAN = re.compile(r"^(?:II|III|IV|V|VI|VII|VIII|IX|X|XI|XII)$")
+_SPACE_GAP = re.compile(r"[ \t]+")
 
 
 class ExactMatcher(BaseMatcher):
@@ -118,6 +122,89 @@ class ExactMatcher(BaseMatcher):
                 continue
             break
         return k if found else j
+
+    def _name_tail(self, ctx: MatchContext, i: int, j: int, cidxs) -> tuple[str, bool]:
+        """(longer name, drop) for a match that may end a longer organisation name
+        ("A Work of Faith Community Outreach Corp" for "Outreach Corp"); ("", False)
+        when the match starts a name.
+
+        A candidate: the token right before the match is a Title-case word on the
+        same line, separated by spaces only, that is not a function word, legal
+        suffix or another claimed match, and no name of the company contains that
+        word pair (an alias covers the longer name).
+
+        ``drop`` is True only when layout cannot explain the run-in:
+        - the gap is exactly one space (a wider gap is a column gap);
+        - the text was not line-joined by the extractor (PDF: a heading line runs
+          into the next line);
+        - the line or cell up to the match is not a heading run-in: Title-case
+          words, commas and "&"/"and" only, no article or other connector
+          ("Application Software Databricks, Inc.", "Health Care Providers &
+          Services Get Heal, Inc." are headings; "A Work of Faith Community ..."
+          is not);
+        - the match ends in a legal suffix or the longer name has two or more
+          words before it ("Microsoft Databricks partnership" is only a hint).
+        A candidate that is not dropped is returned as a hint for the LLM pass."""
+        if not getattr(self.cfg, "drop_name_tail_matches", False) or i == 0:
+            return "", False
+        toks, nt = ctx.ntext.tokens, ctx.ntext
+        p = toks[i - 1]
+        gap = nt.gap(i - 1, i)
+        if ctx.covered[i - 1] or not _SPACE_GAP.fullmatch(gap):
+            return "", False
+        if not (p.cased[:1].isupper() and not p.cased.isupper()):
+            return "", False  # lower-case word, ALL CAPS heading, digit
+        skip = getattr(self, "tail_skip", None)
+        if skip is None:
+            skip = self.tail_skip = {w.lower() for w in getattr(
+                self.cfg, "name_tail_skip_words", DEFAULT_NAME_TAIL_SKIP_WORDS)}
+        if p.key in skip or p.key in self.legal or p.key in self.ext:
+            return "", False
+        pair = f" {p.key} {toks[i].key} "
+        if any(sp.company_idx in cidxs and pair in f" {sp.key} " for sp in self.specs):
+            return "", False
+        k = i - 1  # walk back over the rest of the longer name
+        while k > 0 and _SPACE_GAP.fullmatch(nt.gap(k - 1, k)) and (
+                toks[k - 1].cased[:1].isupper() or toks[k - 1].key in self.connectors):
+            k -= 1
+        while k < i - 1 and toks[k].key in self.connectors:
+            k += 1
+        s0, _ = nt.orig_span(k, i - 1)
+        m0, _ = nt.orig_span(i, i)
+        _, e0 = nt.orig_span(j, j)
+        longer = ctx.text[s0:e0]
+        drop = (gap == " " and not ctx.joined_lines
+                and not self._heading_run_in(ctx.text[:m0])
+                and (toks[j].key in self.legal or toks[j].key in self.ext or i - k >= 2))
+        return longer, drop
+
+    def _heading_run_in(self, before: str) -> bool:
+        """Is the text from the start of the line or cell up to the match a heading
+        (sector / industry label) rather than the start of a longer name?"""
+        segs = re.split(r"(\n| \| |\t| {2,})", before)
+        line = segs[-1].strip()
+        if len(segs) > 2 and segs[-2] == "\n":
+            # a line break inside wrapped prose ("... of Acadia Parish and the\nCommunity
+            # Outreach Corporation") is not the start of a heading: the previous line ends
+            # mid-sentence: a lower-case word, an initial or short title ("D.", "St."), a
+            # comma, or a capitalised word on a line that has ordinary lower-case words
+            prev = segs[-3].rstrip()
+            if re.search(r"(?:\b[a-z][\w'’-]*|\b[A-Z][a-z]?\.|[,&\-])$", prev) or (
+                    re.search(r"[^\W\d_]$", prev)
+                    and any(w[:1].islower() and w.lower() not in self.connectors
+                            for w in re.findall(r"[^\W\d_]+", prev))):
+                return False
+        words = re.findall(r"[^\W_]+(?:['.][^\W_]+)*", line)
+        if not words or re.search(r"[^\w\s,&/'.\-]", line):
+            return False
+        articles = {"a", "an", "the"}
+        for w in words:
+            lw = w.lower()
+            if lw == "and":
+                continue
+            if lw in articles or lw in self.connectors or not w[:1].isupper():
+                return False
+        return True
 
     def _extend(self, ctx: MatchContext, j: int) -> int:
         """Absorb trailing legal suffixes ("... Industries Ltd.")."""
@@ -233,6 +320,19 @@ class ExactMatcher(BaseMatcher):
                             if company_matches_surface(self.companies[cidx], surface)}
             if not best:
                 continue
+            longer, drop = "", False
+            if not any(self.specs[s].source == "ticker" for s in ok):
+                longer, drop = self._name_tail(ctx, i, j2, set(best))
+            if drop:
+                for cidx, sp in best.items():
+                    m = ctx.make_mention(
+                        self.companies[cidx], i + sp.skip_tokens, j2, match_type=sp.match_type,
+                        score=0.0, alias=sp.display, matcher=self.name, ambiguous=len(best) > 1)
+                    m.note = f"tail of a longer name: {longer!r}"
+                    m.extras = {"dropped_by": "name_tail_rule", "name_tail": longer}
+                    ctx.dropped.append(m)
+                log.debug("dropped %r: tail of longer name %r", m.matched_text, longer)
+                continue
             ambiguous = len(best) > 1
             weak = None
             for cidx, sp in best.items():
@@ -251,5 +351,7 @@ class ExactMatcher(BaseMatcher):
                     self.companies[cidx], i + sp.skip_tokens, j2, match_type=sp.match_type,
                     score=score, alias=sp.display, matcher=self.name, ambiguous=ambiguous)
                 m.note = note
+                if longer:  # not dropped (layout may explain it): a hint for --llm-disambiguate
+                    m.extras = {**(m.extras or {}), "name_tail": longer}
                 out.append(m)
         return out

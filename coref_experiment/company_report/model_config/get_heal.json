@@ -4,6 +4,7 @@
  "name": "Get Heal",
  "company": {
   "cik": "0001687019",
+  "legal_name": "Get Heal, Inc.",
   "match": "GET HEAL",
   "name_regex": "get ?heal",
   "aliases": [
@@ -11,6 +12,7 @@
    "Heal, Inc.",
    "Burrito Labs"
   ],
+  "description": "Privately held, venture-backed healthcare company in Los Angeles, California (brand Heal) that provides doctor house calls, in-home primary care visits and telehealth; formerly named Burrito Labs.",
   "employee_company": "Get Heal",
   "spv_key": "heal"
  }

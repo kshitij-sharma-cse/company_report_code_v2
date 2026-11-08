@@ -17,7 +17,7 @@ from .disambiguate import disambiguate_common_words
 from .llm import load_env_file
 from .match import CompanyMatcher
 from .mention import dedupe_output, dedupe_passages
-from .output import build_report, format_table, write_csv, write_json
+from .output import build_report, format_table, write_csv, write_dropped_csv, write_json
 from .runner import discover, load_prior_hit_pages, run, run_llm_pass
 
 
@@ -317,8 +317,10 @@ def main(argv: list[str] | None = None) -> int:
                               _meta(True, {"llm": round(t_llm, 4)}))
 
     disambig_failed, disambig_cause = 0, ""  # mentions left unverified by provider errors
+    llm_dropped: list = []
     if cfg.llm_disambiguate_common_words:
         t3 = time.perf_counter()
+        before_llm = list(mentions)
         disambig_warnings: list[str] = []
         disambig_stats: dict = {}
         mentions = disambiguate_common_words(
@@ -330,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             stats=disambig_stats, max_rpm=cfg.llm_disambiguate_max_rpm)
         t_disambig = time.perf_counter() - t3
         kept_ids = {id(m) for m in mentions}
+        llm_dropped = [m for m in before_llm if id(m) not in kept_ids]
         for r in results:
             r.mentions = [m for m in r.mentions if id(m) in kept_ids]
         report = build_report(mentions, _documents(),
@@ -349,6 +352,21 @@ def main(argv: list[str] | None = None) -> int:
         disambig_cause = next((w.rsplit("): ", 1)[-1] for w in disambig_warnings
                                if "after provider error" in w), "")
     _emit(report)
+
+    # Matches removed by the name-tail rule (and by --llm-disambiguate) are written
+    # and counted, never lost silently. Printed even with --quiet.
+    rule_dropped = [m for r in results for m in r.dropped]
+    hinted = sum(1 for m in mentions if (m.extras or {}).get("name_tail"))
+    if args.out and args.format == "csv":
+        dp = write_dropped_csv([("name_tail_rule", m) for m in rule_dropped]
+                               + [("llm_disambiguate", m) for m in llm_dropped], args.out)
+        where = f" (see {dp})"
+    else:
+        where = ""
+    if rule_dropped or hinted or llm_dropped:
+        print(f"name-tail rule dropped {len(rule_dropped)} match(es); {hinted} kept match(es) "
+              f"carry a name_tail hint; --llm-disambiguate dropped {len(llm_dropped)}{where}",
+              file=sys.stderr)
 
     if not args.quiet and (args.out or args.format != "table"):
         print(format_table(report, max_mentions=0), file=sys.stderr)

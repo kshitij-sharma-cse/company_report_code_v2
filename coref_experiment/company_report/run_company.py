@@ -38,6 +38,7 @@ ap.add_argument("--no-evidence", action="store_true", help="skip the rule-based 
 ap.add_argument("--workers", type=int, default=2, help="processes for evidence_tables.py")
 ap.add_argument("--folders", nargs="*", default=None, help="dump folders of the company (default: config dump_folders, else <co> and every <co>_<word> with a manifest)")
 ap.add_argument("--context-windows", default="", help="context-window workbook (tools/build_context_windows.py): also run evidence_recall.py and evidence_workbook.py")
+ap.add_argument("--companies-file", default="", help="company-finder input CSV, checked for a description (default: Targeted_pdf/*/input/<co>_input.csv, the file prepare_targeted.py reads)")
 args = ap.parse_args()
 co, dumps = args.company, Path(args.dumps)
 
@@ -57,7 +58,14 @@ if not cfg_path.exists():
     sys.exit(f"not configured: {cfg_path} does not exist (copy another company's file and edit it)")
 cfg = json.loads(cfg_path.read_text(encoding="utf-8"), object_hook=Cfg)
 raw, out = dumps / f"{co}_gov" / "sources", HERE / "inputs" / co
-missing = []
+missing, warnings = [], []
+
+
+def warn(msg: str) -> None:                      # printed now and again at the end, where a long run's output ends
+    warnings.append(msg)
+    print("WARNING", msg, flush=True)
+
+
 if args.folders is not None or cfg.get("dump_folders"):  # asked for by name: a folder without a manifest is reported, not dropped quietly
     asked = args.folders if args.folders is not None else cfg["dump_folders"]
     folders = [f for f in asked if (dumps / f"{f}_manifest.csv").exists()]
@@ -68,6 +76,47 @@ else:                                                # <co>, then <co>_ncsr, <co
     if co not in folders:
         missing.append(f"dump folder {co}: no {dumps / co} with {dumps / f'{co}_manifest.csv'} (tools/download_filings.py {co} writes them)")
 print("dump folders:", folders or "none", *(["MISSING", *missing] if missing else []), flush=True)
+TARGETED = next((p for p in (HERE.parent / "Targeted_pdf", HERE.parents[1] / "Resources" / "Targeted_pdf") if p.exists()), HERE.parent / "Targeted_pdf")
+
+
+def companies_rows() -> list:
+    """Company-finder input rows of this company: --companies-file, else the file prepare_targeted.py reads
+    (Targeted_pdf/*/input/<co>_input.csv); a row counts when its canonical_name or an alias equals the config name,
+    --name or a config alias, or its id / cik is the CIK. A file that cannot be read is a warning, never a stop."""
+    import csv
+    files = [Path(args.companies_file)] if args.companies_file else sorted(TARGETED.glob(f"*/input/{co}_input.csv"))
+    names = {re.sub(r"\W+", " ", x).strip().lower() for x in (cfg.get("name", ""), args.name, *cfg.get("company", {}).get("aliases", [])) if x}
+    cik = re.sub(r"\D", "", args.cik).lstrip("0")
+    rows = []
+    for p in files:
+        try:
+            with open(p, newline="", encoding="utf-8-sig") as fh:
+                for row in csv.DictReader(fh):
+                    if None in row:                   # more fields than the header (unquoted comma): DictReader puts them under None
+                        warn(f"company-finder input {p}: a row has more fields than the header ({row.get('canonical_name') or row.get('id')}); quote the values")
+                    row = {(k or "").strip().lower(): (v if isinstance(v, str) else ",".join(v or [])).strip() for k, v in row.items() if k is not None}
+                    forms = [row.get("canonical_name") or row.get("name") or "", *(row.get("aliases") or "").split("|")]
+                    ids = {re.sub(r"\D", "", row.get(k, "")).lstrip("0") for k in ("id", "cik")} - {""}
+                    if {re.sub(r"\W+", " ", x).strip().lower() for x in forms if x} & names or (cik and cik in ids):
+                        rows.append((p, row))
+        except Exception as e:                        # a warning-only check must not stop the run
+            warn(f"company-finder input {p}: not read ({type(e).__name__}: {e})")
+    return rows
+
+
+if not str(cfg.get("company", {}).get("description") or "").strip():   # the disambiguation prompt needs it to reject look-alike names
+    warn(f"model_config/{co}.json has no company.description: company_finder.py --llm-disambiguate then judges mentions from the "
+         "name alone and keeps look-alike organisations (tools/make_companies_file.py copies it into the company-finder input)")
+found = companies_rows()
+if args.companies_file and not found:
+    warn(f"--companies-file {args.companies_file}: no row for {args.name}")
+for p, row in found:
+    if "description" not in row:
+        warn(f"company-finder input {p} has no description column: rerun tools/make_companies_file.py {co}")
+    elif not row["description"]:
+        warn(f"company-finder input {p}: no description for {row.get('canonical_name') or row.get('name')}")
+
+
 np_csv = dumps / f"{co}_nport" / "nport_holdings.csv"
 facts = HERE / "out" / co / "facts"
 steps = [("N-PORT loans", lambda: a.nport(args.nport_db, cfg, out)), ("N-PORT marks", lambda: a.marks(str(np_csv), cfg, out)), ("FPDS", lambda: a.fpds(raw, out)), ("USPTO", lambda: a.uspto(raw, out)),
@@ -117,9 +166,6 @@ cmd = [sys.executable, str(HERE / "build_report.py"), co, "--cik", args.cik, "--
 APP = HERE.parent / "coref_verifier"
 
 
-TARGETED = next((p for p in (HERE.parent / "Targeted_pdf", HERE.parents[1] / "Resources" / "Targeted_pdf") if p.exists()), HERE.parent / "Targeted_pdf")
-
-
 def has_mentions(f: str) -> bool:                 # build_report.py prepares an extra folder with prepare_targeted.py, which needs both
     return any((APP / "data" / "companies").glob(f"{f}__*_mentions.meta.json")) or (       # (same Targeted_pdf as prepare_targeted.py)
         (TARGETED / "dumps" / f"{f}_manifest.csv").exists() and any(TARGETED.glob(f"*/out/{f}_*/{f}_mentions.csv")))
@@ -162,4 +208,6 @@ if args.context_windows:                          # recall check: every number o
     elif run("evidence recall", [str(HERE / "evidence_recall.py"), co, str(Path(args.context_windows).resolve())]):
         run("evidence workbook", [str(HERE / "evidence_workbook.py"), co, cfg.get("name") or args.name, str(ev)])
 print("not built:", missing or "none", flush=True)
+for w in warnings:
+    print("WARNING", w, flush=True)
 sys.exit(rc)

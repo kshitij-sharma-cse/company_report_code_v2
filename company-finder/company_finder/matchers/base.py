@@ -16,6 +16,12 @@ class MatchContext:
     ntext: NormalizedText
     mentions: list[Mention] = field(default_factory=list)
     covered: bytearray = field(default_factory=bytearray)  # 1 per claimed token
+    # True when the extractor joined visual lines with a space (PDF blocks, OCR):
+    # a heading may then run into a name with no line break left to see.
+    joined_lines: bool = False
+    # matches a matcher removed by rule (Mention with extras["dropped_by"]); kept
+    # so the run can report and write them instead of losing them silently
+    dropped: list[Mention] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.covered:

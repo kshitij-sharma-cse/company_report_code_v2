@@ -89,6 +89,13 @@ Only answer true when the excerpt's own content -- not a nearby unrelated compan
 specifically supports the candidate company's described business, products, people, or
 activities.
 
+A matched name that is only the END of a longer organisation name in the excerpt (other \
+capitalised words run straight into it, e.g. "Springfield Community Acme Corp" or "Cancer \
+Center Physicians Network and Acme Corp" for a candidate "Acme Corp") names that other \
+organisation, not the candidate -- answer false, unless the longer name is one of the \
+candidate's listed names. A Description that does not fit the excerpt (different industry, \
+place, era or kind of body, such as a charity, hospital or school) is a strong signal for false.
+
 Write `reason` first (one or two sentences: what the matched word means in this excerpt), \
 then decide `is_company` from that reason. Your `reason` and `is_company` must agree. If your reason describes ordinary usage, a
 financial/accounting term, a title, or a date, `is_company` must be false -- never state in
@@ -134,11 +141,17 @@ def _build_batch_prompt(batch: list[tuple[int, Company, Mention]]) -> str:
     for idx, company, mention in batch:
         if company.id != last_company_id:
             description = company.description or "(no description on file -- judge from the company name and excerpt alone)"
-            lines.append(f"\nCompany: {company.canonical_name}\nDescription: {description}")
+            names = [n for n in dict.fromkeys([company.canonical_name, *company.aliases]) if n]
+            lines.append(f"\nCompany: {company.canonical_name}\nKnown names: {'; '.join(names)}"
+                         f"\nDescription: {description}")
             last_company_id = company.id
+        tail = (mention.extras or {}).get("name_tail")
+        hint = (f'  (capitalised words run straight into the match: "{tail}" -- a heading, '
+                f'sector or category label run into the name does not count against it; '
+                f'another organisation\'s longer name does)\n') if tail else ""
         lines.append(
             f'  Item {idx}: matched text "{mention.matched_text}" in excerpt:\n'
-            f'  ---\n  {_excerpt(mention)}\n  ---'
+            f'{hint}  ---\n  {_excerpt(mention)}\n  ---'
         )
     return "\n".join(lines)
 

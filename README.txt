@@ -59,6 +59,7 @@ Cost and time for Kalshi (27 filings): about $0.25 and 3-4 minutes on the first 
 2 seconds and cost $0.
 
 Typical order for a NEW company:
+  0. company-finder/.venv/bin/python tools/make_companies_file.py <company>      (-> companies file with description)
   1. company-finder/.venv/bin/python company-finder/company_finder.py --companies companies.csv \
          --input Resources/Targeted_pdf/dumps/<company> --llm --out <run>/out/<company>_x/<company>_mentions.csv --format csv
   2. company-finder/.venv/bin/python coref_experiment/coref_verifier/tools/prepare_targeted.py <company>
@@ -127,11 +128,21 @@ company-finder/company_finder.py  (+ package company_finder/)
     loader.py       loads the company list (CSV, JSON, Excel, TXT)
     extract.py      text from PDF / HTML / XML / DOCX / ...
     match.py        name matching (CompanyMatcher)
-    matchers/       exact and fuzzy matcher classes
+    matchers/       exact and fuzzy matcher classes. A match that is the tail of a longer capitalised name
+                    ("A Work of Faith Community Outreach Corp" for "Outreach Corp": a Title-case word right before it,
+                    one space, same line, not a function word or legal suffix) is dropped unless one of the
+                    company's names contains that word pair (config drop_name_tail_matches, name_tail_skip_words).
+                    When layout can explain the run-in it is only hinted (extras.name_tail, shown to
+                    --llm-disambiguate): a gap wider than one space, PDF text (lines are joined), a heading run into
+                    the name ("Application Software Databricks, Inc.": the line or cell up to the match is Title-case
+                    words, commas and &/and only), or a bare name after one word ("Microsoft Databricks").
+                    Dropped matches are written to <out>_dropped.csv (reason name_tail_rule, longer_name; the
+                    --llm-disambiguate drops are there too, reason llm_disambiguate) and counted on stderr.
     variants.py     automatic alias / variant generation and false-positive filtering
     normalise.py    text normalisation with offsets mapped back to the original
     dedupe.py       collapses same-spelling company rows, drops excluded names before matching
-    disambiguate.py common-word disambiguation (false-positive removal) with batched LLM calls
+    disambiguate.py common-word disambiguation (false-positive removal) with batched LLM calls; the prompt has
+                    the company's known names and description
     llm.py          OpenRouter resolution of document-local company references
     context.py      sentence / paragraph boundaries and context snippets
     definitions.py  document-local definitions -> scoped aliases (no LLM)
@@ -159,6 +170,10 @@ tools/download_filings.py <co> [--term "..."] [--skip-forms NPORT-P,NPORT-P/A] [
 
 coref_experiment/company_report/nport.py
   list / download / parse   N-PORT XML from EDGAR (needs SEC_USER_AGENT; TLS via certifi)
+  list [TERM] --dump DIR [--term T ...] [--config ...]
+                            searches every name form: TERM, the config "name" and company.aliases, each --term (a
+                            filing that prints only "Acme Corporation" is missed by a search for "Acme Corp"); hits are
+                            merged by accession, and manifest column search_terms says which forms found each filing.
   export-db TERM --dump DIR --db nport_team.duckdb --config model_config/<co>.json [--match-title]
                             team database rows whose ISSUER_NAME matches (^|\W)(name_regex)(\W|$) -> DIR/duckdb_rows.csv
                             (whole words, so "get heal" does not match "TARGET HEALTHCARE"). Stops with exit 1 when
@@ -168,11 +183,22 @@ coref_experiment/company_report/nport.py
                             file may be absent, not both. A row is the company's own equity when its issuer name starts
                             with name_regex; a vehicle named after it is spv_interest.
   Name pattern (parse, export-db, build): company.name_regex of --config; without --config, model_config/<co>.json
-  with <co> from a DIR named <co>_nport or from the TERM's words; else the TERM's words with any punctuation between
-  them ("Get Heal, Inc." also matches "GET HEAL INC"). The pattern used is printed.
+  with <co> from a DIR named <co>_nport or from the TERM's words; else the words of TERM and of the config "name" with
+  any punctuation between them ("Get Heal, Inc." also matches "GET HEAL INC"), as alternatives. Aliases are never
+  used here (a generic alias would let another issuer in as the company's own equity); list searches them, parse
+  filters. The pattern used is printed. TERM is optional when the config is found.
   Usual order: export-db "<Name>" --dump <root>/dumps/<co>_nport --db ... --config model_config/<co>.json ;
                build "<Name>" --dump <root>/dumps/<co>_nport --config model_config/<co>.json
                --out <root>/dumps/<co>_nport/nport_holdings.csv
+
+tools/make_companies_file.py <co> [--out FILE.csv] [--config FILE.json] [--name "Legal Name"] [--force]
+  The company-finder input CSV (id, canonical_name, aliases, description) from the config: id C<cik>, canonical_name
+  company.legal_name (else --name, else "name"), aliases "name" + company.aliases, company.description. Default --out:
+  coref_experiment/Targeted_pdf/run1/input/<co>_input.csv. An existing file is never overwritten without --force: the
+  company's row keeps its id, canonical_name and aliases (prepare_targeted.py copies canonical_name into every prepared
+  filing) and only gets the description filled.
+  company.description (what the company does, where, former names) goes into the --llm-disambiguate prompt, so a
+  look-alike organisation ("... Community Outreach Corp", a hospital board) is rejected; without it the tool warns.
 
 tools/build_formd_db.py <co> [--xml-dir DIR ...] [--out PATH] [--no-fetch] [--force]
   Only when the team's formd.duckdb is missing. Builds the same tables (companies, filings, related_persons,
@@ -201,10 +227,14 @@ coref_experiment/company_report/run_company.py <co> --cik CIK --name "..." [opti
   (prepared filings, or a Targeted_pdf mentions csv plus Targeted_pdf/dumps/<f>_manifest.csv); otherwise it is used by
   the evidence steps only and listed under "not built". A requested folder without a manifest is listed there too.
   A config key a step needs but the company lacks (peers, k401_plan ...) is listed as "not configured" at the end.
+  WARNING (at the start and again at the end) when the config has no company.description, or when the
+  company-finder input (--companies-file, else Targeted_pdf/*/input/<co>_input.csv, the file prepare_targeted.py
+  reads) has no description column or an empty description. A file it cannot read is a warning, never a stop.
 
 New company, in order:
   tools/download_filings.py <co>                     -> dumps/<co>, dumps/<co>_manifest.csv
   nport.py export-db + build                          -> dumps/<co>_nport/nport_holdings.csv
+  tools/make_companies_file.py <co>                  -> Targeted_pdf/run1/input/<co>_input.csv
   company_finder.py ... ; prepare_targeted.py <co>    (see "Typical order" above)
   tools/build_formd_db.py <co>                        only without the team's formd.duckdb
   tools/build_context_windows.py <co> --out <file>

@@ -21,7 +21,8 @@ class Company:
     id: str
     canonical_name: str
     # Short description used only by the LLM common-word disambiguation pass
-    # (never affects matching itself). Empty means that pass skips this company.
+    # (never affects matching itself). Empty means the prompt falls back to the
+    # company name and excerpt alone.
     description: str = ""
     aliases: list[str] = field(default_factory=list)
     ticker: str | None = None            # may hold several, pipe-separated

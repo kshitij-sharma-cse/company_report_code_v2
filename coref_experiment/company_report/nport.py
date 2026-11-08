@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Form N-PORT holdings of one company. N-PORT is structured XML, so no model is used and every value is the filed value.
 
-  nport.py list     COMPANY_TERM --dump DIR     EDGAR full-text search -> DIR/manifest.csv
+  nport.py list     [COMPANY_TERM] --dump DIR [--term T ...]   EDGAR full-text search -> DIR/manifest.csv
   nport.py download --dump DIR                  fetches each primary_doc.xml (gzipped), resumes, ~5 requests/s
-  nport.py parse    COMPANY_TERM --dump DIR --out FILE.csv     one row per position that names the company
-  nport.py export-db COMPANY_TERM --dump DIR --db nport_team.duckdb [--config model_config/<co>.json]
+  nport.py parse    [COMPANY_TERM] --dump DIR --out FILE.csv     one row per position that names the company
+  nport.py export-db [COMPANY_TERM] --dump DIR --db nport_team.duckdb [--config model_config/<co>.json]
                                                 team database rows whose issuer name matches -> DIR/duckdb_rows.csv
-  nport.py build    COMPANY_TERM --dump DIR --out FILE.csv     merged, amendments applied, classified (input to build_report --nport-csv)
-The company's name pattern is company.name_regex of --config (default: model_config/<co>.json, <co> from a DIR named
-<co>_nport or from the term's words), else the term's words; parse, export-db and build all use it.
+  nport.py build    [COMPANY_TERM] --dump DIR --out FILE.csv     merged, amendments applied, classified (input to build_report --nport-csv)
+The config is --config, else model_config/<co>.json with <co> from a DIR named <co>_nport or from the term's words.
+list searches every name form: the term, the config "name" and company.aliases, and each --term (a filing that prints only
+"Acme Corporation" is missed by a search for "Acme Corp"); hits are merged by accession and manifest column search_terms says
+which forms found each filing. The name pattern of parse, export-db and build is the config company.name_regex, else the
+words of the term and the config "name" (never the aliases); COMPANY_TERM is optional when the config is found.
 SEC requests need a contact: export SEC_USER_AGENT="your-org contact@your-domain".
 """
 import argparse, collections, csv, datetime as dt, gzip, json, os, re, ssl, sys, threading, time, urllib.parse, urllib.request
@@ -61,14 +64,19 @@ def windows():
 
 
 def cmd_list(a):
+    terms = name_forms(a)
+    if not terms:
+        sys.exit("list: no search term; give COMPANY_TERM, --term or a --config with name / company.aliases")
+    print("search terms:", terms, file=sys.stderr)
     sec_setup()
     dump = Path(a.dump); dump.mkdir(parents=True, exist_ok=True)
     seen = {}
-    for form in FORMS:
+    for term, form in ((t, f) for t in terms for f in FORMS):
+        before = len(seen)
         for s, e in windows():
             frm, total = 0, 1
             while frm < total and frm < 10000:
-                q = urllib.parse.urlencode({"q": f'"{a.term}"', "forms": form, "startdt": s, "enddt": e, "from": frm}, safe="/")
+                q = urllib.parse.urlencode({"q": f'"{term}"', "forms": form, "startdt": s, "enddt": e, "from": frm}, safe="/")
                 h = json.loads(get(f"https://efts.sec.gov/LATEST/search-index?{q}"))["hits"]
                 total = h["total"]["value"]
                 for x in h["hits"]:
@@ -77,15 +85,19 @@ def cmd_list(a):
                     e0 = seen.setdefault(adsh, {"accession": adsh, "document": "primary_doc.xml", "form": src.get("form"),
                                                 "file_date": src.get("file_date"), "period": src.get("period_ending"),
                                                 "cik": str(int(src["ciks"][0])), "filer": (src.get("display_names") or [""])[0],
-                                                "hit_in_primary": ""})
+                                                "hit_in_primary": "", "search_terms": ""})
+                    if term not in e0["search_terms"].split(" | "):
+                        e0["search_terms"] = " | ".join(x for x in (e0["search_terms"], term) if x)
                     if doc == "primary_doc.xml":          # a trust-wide exhibit can name a holding of another series
                         e0["hit_in_primary"] = "Y"
                 if not h["hits"]:
                     break
                 frm += len(h["hits"])
             if total >= 10000:
-                print("window over 10,000 hits, list is cut:", s, e)
-            print(form, s, e, "window", total, "total so far", len(seen), flush=True)
+                print("window over 10,000 hits, list is cut:", term, form, s, e)
+        print(f"{term!r} {form}: {len(seen) - before} new filings, {len(seen)} in all", flush=True)
+    if not seen:
+        sys.exit(f"list: 0 filings for {terms}")
     rows = sorted(seen.values(), key=lambda r: r["file_date"])
     with open(dump / "manifest.csv", "w", newline="") as f:
         w = csv.DictWriter(f, list(rows[0].keys())); w.writeheader(); w.writerows(rows)
@@ -268,19 +280,43 @@ def config_path(a) -> Path | None:
         if not Path(a.config).exists():
             sys.exit(f"--config: {a.config} not found")
         return Path(a.config)
-    cands = [re.sub(r"_nport$", "", Path(a.dump).resolve().name), "_".join(re.findall(r"\w+", a.term.lower()))]
+    cands = [re.sub(r"_nport$", "", Path(a.dump).resolve().name)] + (["_".join(re.findall(r"\w+", a.term.lower()))] if a.term else [])
     return next((CONFIG / f"{c}.json" for c in cands if (CONFIG / f"{c}.json").exists()), None)
 
 
-def name_regex(a) -> str:
-    """Company name pattern: config company.name_regex, else the term's words with any punctuation or space between them
-    ("Get Heal, Inc." -> Get, Heal, Inc joined by \\W+, which also matches 'GET HEAL INC')."""
+def load_config(a) -> dict:
     p = config_path(a)
-    rx = json.loads(p.read_text(encoding="utf-8")).get("company", {}).get("name_regex", "") if p else ""
+    return json.loads(p.read_text(encoding="utf-8")) if p else {}
+
+
+def name_forms(a) -> list[str]:
+    """Every name form to search: the term, the config "name" and company.aliases, then each --term; case-insensitive
+    duplicates once."""
+    cfg = load_config(a)
+    forms = [a.term or "", cfg.get("name", ""), *cfg.get("company", {}).get("aliases", []), *(a.terms or [])]
+    out = {}
+    for f in forms:
+        f = re.sub(r"\s+", " ", str(f or "")).strip()
+        if f and f.lower() not in out:
+            out[f.lower()] = f
+    return list(out.values())
+
+
+def name_regex(a) -> str:
+    """Company name pattern: config company.name_regex, else the term and the config "name" (not the aliases: a generic
+    alias such as "Heal, Inc." would let other issuers in as the company's own equity), each one's words with any
+    punctuation or space between them ("Get Heal, Inc." -> Get, Heal, Inc joined by \\W+, which also matches
+    'GET HEAL INC'), as alternatives."""
+    p = config_path(a)
+    cfg = load_config(a)
+    rx = cfg.get("company", {}).get("name_regex", "")
+    forms = list(dict.fromkeys(f.strip() for f in (a.term or "", cfg.get("name", "")) if f and f.strip()))
+    if not rx and not forms:
+        sys.exit("no company name: give COMPANY_TERM or a --config with company.name_regex or name")
     if not getattr(a, "_said", False):
-        print("name pattern from", f"{p} company.name_regex" if rx else f"the term {a.term!r} (no config name_regex)", file=sys.stderr)
+        print("name pattern from", f"{p} company.name_regex" if rx else f"{forms} (no config name_regex; aliases are not used)", file=sys.stderr)
         a._said = True
-    return rx or r"\W+".join(re.escape(w) for w in re.findall(r"\w+", a.term))
+    return rx or "|".join(r"\W+".join(re.escape(w) for w in re.findall(r"\w+", f)) for f in forms if re.search(r"\w", f))
 
 
 def edged(rx: str) -> str:
@@ -312,7 +348,8 @@ def cmd_export_db(a):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["list", "download", "parse", "build", "export-db"])
-    ap.add_argument("term", nargs="?", default="Databricks")
+    ap.add_argument("term", nargs="?", default="", help="a company name form; optional when the config is found (--config or DIR <co>_nport)")
+    ap.add_argument("--term", dest="terms", action="append", default=[], help="list: one more name form to search (repeatable)")
     ap.add_argument("--dump", required=True)
     ap.add_argument("--out", default="nport.csv")
     ap.add_argument("--limit", type=int, default=0)

@@ -392,6 +392,30 @@ def write_csv(report: dict, out_path: str | None, *, mentions_detail: bool = Tru
     return written
 
 
+def dropped_path(out_path: str | Path) -> Path:
+    """``OUT.csv`` -> ``OUT_dropped.csv`` (what prepare_targeted.py looks for)."""
+    dest = Path(out_path)
+    return dest.with_name(dest.stem + "_dropped.csv")
+
+
+def write_dropped_csv(dropped: list[tuple[str, object]], out_path: str | Path) -> str:
+    """Matches removed after matching, one row each: ``reason`` (``name_tail_rule``:
+    tail of a longer name, see ``longer_name``; ``llm_disambiguate``: the model said
+    it is not the company, see ``extras``) plus the usual mention columns.  Always
+    written (header only when nothing was dropped) so an old file is not left behind."""
+    dest = dropped_path(out_path)
+    with open(dest, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["reason", "longer_name"] + csv_fieldnames(),
+                           extrasaction="ignore")
+        w.writeheader()
+        for reason, m in dropped:
+            row = _csv_row(m if isinstance(m, dict) else m.to_dict())
+            extras = (m.get("extras") if isinstance(m, dict) else m.extras) or {}
+            row.update(reason=reason, longer_name=extras.get("name_tail", ""))
+            w.writerow(row)
+    return str(dest)
+
+
 
 
 

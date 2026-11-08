@@ -4,6 +4,7 @@
  "name": "Outreach Corp",
  "company": {
   "cik": "0001537182",
+  "legal_name": "Outreach Corp",
   "match": "OUTREACH CORP",
   "name_regex": "outreach\\s+corp(?:oration)?|componentlab",
   "aliases": [
@@ -11,6 +12,7 @@
    "Outreach Corporation",
    "ComponentLab"
   ],
+  "description": "Privately held, venture-backed software company in Seattle, Washington that makes a sales engagement platform (software for sales teams to manage emails, calls and pipeline); formerly named ComponentLab, Inc.",
   "employee_company": "Outreach",
   "spv_key": "outreach"
  }

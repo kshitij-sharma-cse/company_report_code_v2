@@ -31,6 +31,7 @@ class DocumentResult:
     text_chars: int = 0
     filer: dict | None = None               # filer/issuer facts (SGML header, iXBRL dei, Form D)
     filer_company_ids: list[str] = field(default_factory=list)
+    dropped: list[Mention] = field(default_factory=list)  # removed by a matcher rule (name-tail)
 
 
 def discover(inputs: list[str | Path], recursive: bool = True) -> list[Path]:
@@ -111,8 +112,11 @@ def _signature_person(unit: TextUnit, m: Mention) -> None:
         m.note = "; ".join(x for x in (m.note, "on a /s/ signature line (person's name?)") if x)
 
 
-def match_unit(matcher: CompanyMatcher, unit: TextUnit, doc: str) -> list[Mention]:
-    out = _match_unit(matcher, unit, doc)
+def match_unit(matcher: CompanyMatcher, unit: TextUnit, doc: str, *,
+               joined_lines: bool = False, dropped: list | None = None) -> list[Mention]:
+    """Mentions in one unit. ``joined_lines``: the extractor joined visual lines
+    (PDF). Matches removed by a matcher rule are appended to ``dropped``."""
+    out = _match_unit(matcher, unit, doc, joined_lines, dropped)
     for m in out:
         _signature_person(unit, m)
     for m in out:
@@ -153,27 +157,34 @@ def _apply_cik(matcher: CompanyMatcher, unit: TextUnit, doc: str, out: list[Ment
             m.score = min(m.score, 70.0)
 
 
-def _match_unit(matcher: CompanyMatcher, unit: TextUnit, doc: str) -> list[Mention]:
+def _match_unit(matcher: CompanyMatcher, unit: TextUnit, doc: str, joined_lines: bool = False,
+                dropped: list | None = None) -> list[Mention]:
     width = matcher.config.context_max_chars
     out: list[Mention] = []
     if unit.cells:
         # match each cell separately (no matches across cell borders); context = row
         for s, e, cell_loc in unit.cells:
-            for m in matcher.find(unit.text[s:e], with_context=False):
+            ms, ctx = matcher.find_with_context(unit.text[s:e], with_context=False,
+                                                joined_lines=joined_lines)
+            for m in ms + ctx.dropped:
                 a, b = s + m.char_start, s + m.char_end
                 m.context = snippet(unit.text, a, b, width)
                 m._abs = (a, b)
                 _enrich_evidence(m, unit.text, a, b)
                 loc = {**unit.location, **cell_loc}
                 _place(m, loc, doc)
-                out.append(m)
+            out.extend(ms)
+            if dropped is not None:
+                dropped.extend(ctx.dropped)
         return out
-    mentions = matcher.find(unit.text)
-    for m in mentions:
+    mentions, ctx = matcher.find_with_context(unit.text, joined_lines=joined_lines)
+    for m in mentions + ctx.dropped:
         m._abs = (m.char_start, m.char_end)
         _enrich_evidence(m, unit.text, m.char_start, m.char_end)
         _place(m, _text_loc(unit, m.char_start), doc)
-        out.append(m)
+    out.extend(mentions)
+    if dropped is not None:
+        dropped.extend(ctx.dropped)
     return out
 
 
@@ -305,8 +316,9 @@ def process_file(matcher: CompanyMatcher, path: str | Path, opts: ExtractOptions
         if dump_text_dir:
             _dump(ex, dump_text_dir)
         unit_mentions = []
+        joined = ex.doc_type == "pdf"  # PDF blocks: visual lines joined with a space
         for unit in ex.units:
-            ms = match_unit(matcher, unit, str(path))
+            ms = match_unit(matcher, unit, str(path), joined_lines=joined, dropped=res.dropped)
             unit_mentions.append((unit, ms))
             res.mentions.extend(m for m in ms if m.score >= min_score)
         if matcher.config.defined_terms:
@@ -444,7 +456,8 @@ def run_llm_pass(matcher: CompanyMatcher, results: list[DocumentResult], opts: E
             continue
         unit_mentions = []
         for unit in ex.units:
-            unit_mentions.append((unit, match_unit(matcher, unit, res.path)))
+            unit_mentions.append((unit, match_unit(matcher, unit, res.path,
+                                                   joined_lines=ex.doc_type == "pdf")))
         if matcher.config.defined_terms:
             _apply_defined_terms(unit_mentions, res.path)
         filer_ids = set(res.filer_company_ids or [])

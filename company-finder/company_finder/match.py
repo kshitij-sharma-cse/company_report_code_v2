@@ -194,13 +194,17 @@ class CompanyMatcher:
         return ms + self._extra
 
     # ------------------------------------------------------------------ find
-    def find(self, text: str, *, with_context: bool = True) -> list[Mention]:
+    def find(self, text: str, *, with_context: bool = True,
+             joined_lines: bool = False) -> list[Mention]:
         """Return mentions in ``text`` (offsets refer to ``text``)."""
-        return self.find_with_context(text, with_context=with_context)[0]
+        return self.find_with_context(text, with_context=with_context, joined_lines=joined_lines)[0]
 
-    def find_with_context(self, text: str, *, with_context: bool = True
-                          ) -> tuple[list[Mention], MatchContext]:
-        ctx = MatchContext(text, NormalizedText(text))
+    def find_with_context(self, text: str, *, with_context: bool = True,
+                          joined_lines: bool = False) -> tuple[list[Mention], MatchContext]:
+        """``joined_lines``: the text's visual lines were joined with spaces (PDF),
+        so a matcher cannot tell a heading run into a name from a longer name.
+        Matches a matcher removed by rule are in ``ctx.dropped``."""
+        ctx = MatchContext(text, NormalizedText(text), joined_lines=joined_lines)
         if ctx.ntext.tokens:
             for m in self.matchers:
                 ctx.mentions.extend(m.find(ctx))
@@ -208,7 +212,7 @@ class CompanyMatcher:
         ctx.mentions.sort(key=lambda m: (m.char_start, -m.char_end, m.company_id))
         if with_context:
             w = self.config.context_max_chars
-            for m in ctx.mentions:
+            for m in ctx.mentions + ctx.dropped:
                 m.context = snippet(text, m.char_start, m.char_end, w)
         return ctx.mentions, ctx
 

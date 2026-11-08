@@ -80,6 +80,28 @@ DEFAULT_STOP_WORDS = [
 # allowed to be lower-case inside capitalised names ("Bank of India").
 DEFAULT_CONNECTORS = ["of", "and", "the", "for", "de", "la", "du", "von", "van"]
 
+# Capitalised words that may stand right before a company name without being
+# part of a longer organisation name: articles, prepositions, pronouns and
+# sentence starters ("The Outreach Corp ...", "From Acme Inc ..."). Any other
+# Title-case word directly before a match makes the match the tail of a
+# longer name (see ``drop_name_tail_matches``).
+DEFAULT_NAME_TAIL_SKIP_WORDS = [
+    "a", "an", "the", "this", "that", "these", "those", "our", "its", "their",
+    "his", "her", "my", "your", "we", "us", "it", "they", "at", "by", "for", "from",
+    "in", "into", "of", "on", "onto", "to", "with", "within", "without", "and",
+    "or", "nor", "but", "as", "about", "via", "per", "than", "versus", "vs",
+    "between", "among", "under", "over", "after", "before", "during", "since",
+    "until", "upon", "against", "through", "across", "including", "include",
+    "includes", "excluding", "except", "like", "unlike", "if", "when", "while",
+    "where", "whereas", "although", "though", "because", "also", "both", "each",
+    "every", "all", "any", "some", "no", "not", "only", "such", "other", "see",
+    "which", "who", "whom", "whose", "what", "why", "how", "is", "was", "are",
+    "were", "be", "been", "has", "have", "had", "do", "does", "did", "will",
+    "would", "shall", "should", "may", "might", "can", "could", "must", "then",
+    "there", "here", "so", "yet", "re", "regarding", "concerning",
+    "former", "formerly", "previously", "currently", "now", "named", "called",
+]
+
 
 @dataclass
 class Config:
@@ -123,6 +145,16 @@ class Config:
     # Similar-name handling (private companies): flag "<name> Holdings II, LLC".
     entity_words: list[str] = field(default_factory=lambda: list(DEFAULT_ENTITY_WORDS))
     longer_entity_score: float = 85.0
+    # A match directly preceded (one space, same line) by another Title-case
+    # word is the tail of a longer organisation name ("A Work of Faith Community
+    # Outreach Corp", "Cancer Center Outreach Corporation") and is dropped,
+    # unless one of the company's own names contains that word pair. Not dropped,
+    # only hinted (extras["name_tail"], shown to --llm-disambiguate) when layout
+    # can explain it: a wider gap, PDF text (lines joined), a heading run-in
+    # ("Application Software Databricks, Inc."), or a bare name after one word
+    # ("Microsoft Databricks"). Dropped matches go to <out>_dropped.csv.
+    drop_name_tail_matches: bool = True
+    name_tail_skip_words: list[str] = field(default_factory=lambda: list(DEFAULT_NAME_TAIL_SKIP_WORDS))
     # pick up document-local short names: Foo Bar, LLC ("Foo") -> later "Foo" matches
     defined_terms: bool = True
 
