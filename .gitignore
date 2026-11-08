@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+out/
+inputs/
+coref_verifier/data/
+Targeted_pdf/
+.venv/

@@ -1,0 +1,13 @@
+pyahocorasick>=2.0
+rapidfuzz>=3.0
+PyMuPDF>=1.23
+python-docx>=1.0
+beautifulsoup4>=4.12
+lxml>=4.9
+openpyxl>=3.1
+python-pptx>=0.6.23
+pytesseract>=0.3.10   # optional: OCR (also needs the tesseract binary)
+Pillow>=10            # used with pytesseract
+# development / tests / sample generation
+pytest>=7
+reportlab>=4

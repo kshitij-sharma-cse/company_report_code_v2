@@ -1,0 +1,18 @@
+{
+ "as_of": "2026-11-02",
+ "fy_end_month": 12,
+ "health_plan": "501",
+ "k401_plan": "001",
+ "name": "Horizon3 AI",
+ "company": {
+  "cik": "0001801975",
+  "match": "HORIZON3",
+  "name_regex": "horizon ?3",
+  "aliases": [
+   "Horizon3",
+   "Horizon 3 AI"
+  ],
+  "employee_company": "Horizon3 AI",
+  "spv_key": "horizon3"
+ }
+}
