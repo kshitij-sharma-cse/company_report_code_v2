@@ -16,7 +16,14 @@ ev = HERE / "out" / co / "evidence"
 cfg = json.loads((HERE / "model_config" / f"{co}.json").read_text(encoding="utf-8"))
 day_, ratio = cfg.get("split_date", "0"), cfg.get("split_ratio", 1)
 win = cfg.get("mark_window_months", 3)     # an N-PORT mark further than this from the row's date says nothing about the row's price
-P = list(csv.DictReader(open(ev / "parsed_rows.csv", encoding="utf-8")))
+with open(ev / "parsed_rows.csv", encoding="utf-8") as _fh:
+    _rd = csv.DictReader(_fh)
+    P = list(_rd)
+    P_COLS = list(_rd.fieldnames or [])             # kept for the header when no table row names the company
+dumps_dir = HERE.parents[2] / "dumps"
+FOLDERS = cfg.get("dump_folders") or [co] + sorted(p.name[:-13] for p in dumps_dir.glob(f"{co}_*_manifest.csv"))
+from finder_verdicts import lookalikes        # noqa: E402
+LOOK = lookalikes(FOLDERS)                     # filings where company-finder dropped every mention as another organisation
 npf, mkf = HERE.parents[2] / "dumps" / f"{co}_nport" / "nport_holdings.csv", HERE / "inputs" / co / "data" / "nport_price_monthly.csv"
 np_ = list(csv.DictReader(open(npf, encoding="utf-8"))) if npf.exists() else []     # a company no fund reports on N-PORT has none
 by = collections.defaultdict(list)
@@ -82,13 +89,19 @@ for r in P:
             else:
                 tier = "B stated"
     out.append({**r, "tier": tier, "why": why})
+n_look = 0
+for r in out:                                    # the name pattern also matches look-alikes; the finder's verdict decides
+    if r["accession"] in LOOK and r["tier"] != "not a position":
+        r["tier"], r["why"] = "not a position", LOOK[r["accession"]]
+        n_look += 1
+print(f"look-alike filings (company-finder): {len(LOOK)}; table rows set aside: {n_look}")
 # a table with a row confirmed by N-PORT has its unit proven for the other rows of that table
 proven = {(r["accession"], r["table"]) for r in out if r["tier"] == "A N-PORT"} | {(r["accession"], r["header"]) for r in out if r["tier"] == "A N-PORT"}
 for r in out:
     if r["why"].startswith("no unit printed") and ((r["accession"], r["table"]) in proven or (r["accession"], r["header"]) in proven):
         r["tier"], r["why"] = "B stated", ""
         r["unit"] = "dollars, proven by another row of this filing with the same header"
-head = list(P[0]) + ["qty_usd", "cost_usd", "value_usd", "commitment_usd", "report_date", "tier", "why"]
+head = (list(P[0]) if P else P_COLS) + ["qty_usd", "cost_usd", "value_usd", "commitment_usd", "report_date", "tier", "why"]
 with open(ev / "evidence_rows.csv", "w", newline="", encoding="utf-8") as fh:
     w = csv.DictWriter(fh, head, extrasaction="ignore")
     w.writeheader()

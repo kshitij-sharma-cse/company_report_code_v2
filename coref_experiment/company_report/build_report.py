@@ -184,7 +184,9 @@ def digits_in(n, text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------------------------- 1. Form D
-def load_formd(db_path: Path, cik: str, spv_key: str) -> dict:
+def load_formd(db_path: Path, cik: str, spv_key: str, look: dict | None = None) -> dict:
+    """look: accession -> reason for filings company-finder judged look-alikes (finder_verdicts.py); a fund whose every Form D
+    is one is left out of the SPVs (listed under spvs_left_out)."""
     import duckdb
 
     db = duckdb.connect(str(db_path), read_only=True)
@@ -204,31 +206,66 @@ def load_formd(db_path: Path, cik: str, spv_key: str) -> dict:
         FROM main.filings WHERE cik = ? ORDER BY filing_date""", [cik])
     # an amendment restates the whole offering: keep the latest filing of each offering (file number, else accession)
     offerings: dict = {}
+    group: dict = collections.defaultdict(list)
+    by_acc = {f["accession_number"]: f for f in filings}
     for f in filings:
-        key = f["file_num"] or f["previous_accession_number"] or f["accession_number"]
+        prev = f["previous_accession_number"]
+        while prev in by_acc and by_acc[prev]["previous_accession_number"] and by_acc[prev]["previous_accession_number"] != prev:
+            prev = by_acc[prev]["previous_accession_number"]   # an amendment of an amendment: back to the original notice
+        key = f["file_num"] or prev or f["accession_number"]
+        f["offering_key"] = key
+        group[key].append(f)
         offerings[key] = f
+    for key, fs in group.items():                      # the latest notice carries the numbers; the first one dates the offering
+        last = offerings[key]
+        last["first_filed"] = min(x["filing_date"] for x in fs)
+        last["notices"] = " | ".join(f"{x['submission_type']} {str(x['filing_date'])[:10]} {x['accession_number']}: "
+                                     f"{money(x['total_amount_sold'])} sold" for x in sorted(fs, key=lambda x: x["filing_date"]))
+        for x in fs:
+            x["latest_of_offering"] = "yes" if x is last else "no"
     offs = sorted(offerings.values(), key=lambda f: (as_date(f["sale_date"]) or as_date(f["filing_date"])))
-    people_rows = rows("""SELECT p.first_name, p.last_name, p.relationship_1, p.relationship_2, p.relationship_3,
-        f.filing_date FROM main.related_persons p JOIN main.filings f USING (accession_number) WHERE f.cik = ?""", [cik])
+    pcols = {r["column_name"] for r in rows("SELECT column_name FROM information_schema.columns WHERE table_name = 'related_persons'")}
+    people_rows = rows(f"""SELECT p.first_name, {"p.middle_name" if "middle_name" in pcols else "NULL AS middle_name"}, p.last_name, p.relationship_1,
+        p.relationship_2, p.relationship_3, f.filing_date FROM main.related_persons p JOIN main.filings f USING (accession_number) WHERE f.cik = ?""", [cik])
     people: dict = {}
     for p in people_rows:
-        name = re.sub(r"\s+", " ", f"{p['first_name'] or ''} {p['last_name'] or ''}").strip().title()
+        mid = p.get("middle_name") or ""
+        mid = mid if len(mid.strip(".")) > 1 else ""      # a middle initial is left out ('Jose Calle Gordo', not 'Jose C. Gordo')
+        name = re.sub(r"\s+", " ", f"{p['first_name'] or ''} {mid} {p['last_name'] or ''}").strip().title()
         w = norm_name(name).split()
         key = " ".join(sorted({w[0], w[-1]})) if w else name   # 'Antani Snehal' = 'Snehal Antani'; 'Gordon Leland Hempton' = 'Gordon S. Hempton'
-        e = people.setdefault(key, {"name": name, "roles": set(), "first": p["filing_date"], "last": p["filing_date"], "n": 0, "names": collections.Counter()})
-        e["roles"].update(r for r in (p["relationship_1"], p["relationship_2"], p["relationship_3"]) if r)
+        e = people.setdefault(key, {"name": name, "roles": set(), "first": p["filing_date"], "last": p["filing_date"], "n": 0, "names": collections.Counter(),
+                                    "role_dates": {}})
+        for r in (p["relationship_1"], p["relationship_2"], p["relationship_3"]):
+            if r:                                      # each role with the first and last notice that names it: roles change over the years
+                e["roles"].add(r)
+                d0 = e["role_dates"].get(r, (p["filing_date"], p["filing_date"]))
+                e["role_dates"][r] = (min(d0[0], p["filing_date"]), max(d0[1], p["filing_date"]))
         e["first"], e["last"] = min(e["first"], p["filing_date"]), max(e["last"], p["filing_date"])
         e["n"] += 1
         e["names"][name] += 1
-    for e in people.values():                          # one person under two spellings: the commonest one
-        e["name"] = e["names"].most_common(1)[0][0]
+    for e in people.values():                          # one person under two spellings: the commonest one, or a fuller form of it
+        best = e["names"].most_common(1)[0][0]
+        e["name"] = max((n for n in e["names"] if set(best.lower().split()) <= set(n.lower().split())), key=len, default=best)
     spvs = [r for r in rows("""SELECT cik, company_name, total_raised, total_investors, first_filing, last_filing
         FROM main.companies WHERE category = 'fund' AND company_name ILIKE ? ORDER BY first_filing""", [f"%{spv_key}%"])
             if re.search(rf"\b{re.escape(spv_key)}\b", r["company_name"], re.I)]
+    left_out = []
+    if spvs and look:                                  # a fund named like the company whose Form D the finder judged a look-alike
+        keep = []
+        for x in spvs:
+            accs = [r["accession_number"] for r in rows("SELECT accession_number FROM main.filings WHERE cik = ?", [x["cik"]])]
+            (left_out if accs and all(acc in look for acc in accs) else keep).append(x)
+        spvs = keep
+    fcols = {r["column_name"] for r in rows("SELECT column_name FROM information_schema.columns WHERE table_name = 'filings'")}
+    want = [c for c in ("street1", "street2", "city", "state", "industry", "jurisdiction_of_inc", "year_of_inc") if c in fcols]
+    profile = rows(f"SELECT accession_number, filing_date, submission_type, {', '.join(want)} FROM main.filings WHERE cik = ? ORDER BY filing_date",
+                   [cik]) if want else []
     db_until = rows("SELECT max(filing_date) AS m FROM main.filings")[0]["m"]
     years_inc = [f["year_of_inc"] for f in filings if f["year_of_inc"] and str(f["year_of_inc"]).isdigit()]
     return {"company": comp[0], "filings": filings, "offerings": offs, "people": sorted(people.values(), key=lambda p: p["first"]),
-            "spvs": spvs, "db_until": db_until, "year_of_inc": int(years_inc[0]) if years_inc else None}
+            "spvs": spvs, "spvs_left_out": left_out, "db_until": db_until, "profile": profile, "year_of_inc": int(years_inc[0]) if years_inc else None,
+            "inc_note": next((str(f["year_of_inc"]) for f in filings if f["year_of_inc"] and not str(f["year_of_inc"]).isdigit()), "")}
 
 
 def previous_names(dirs: list[str], cik: str) -> list[str]:
@@ -273,10 +310,34 @@ def person_parts(name: str) -> tuple:
     return (w[-1], w[:-1], nick[1].lower() if nick else "") if w else ("", [], "")
 
 
+def one_edit(a: str, b: str) -> bool:
+    """a and b differ by one inserted, deleted or replaced letter."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    i = 0
+    while i < min(len(a), len(b)) and a[i] == b[i]:
+        i += 1
+    return a[i + 1:] == b[i + 1:] or a[i + 1:] == b[i:] or a[i:] == b[i + 1:]
+
+
+def role_text(p: dict) -> str:
+    """'Director (2020–2025), Executive Officer (2021–2025)': each role with the years of the first and last notice naming it."""
+    rd = p.get("role_dates") or {}
+    if not rd:
+        return ", ".join(sorted(p["roles"]))
+    out = []
+    for r, (d0, d1) in sorted(rd.items(), key=lambda x: (x[1][0], x[0])):
+        y0, y1 = as_date(d0).year, as_date(d1).year
+        out.append(f"{r} ({y0}{'–' + str(y1) if y1 != y0 else ''})")
+    return ", ".join(out)
+
+
 def same_person(a: str, b: str, aliases: dict) -> bool:
     """Same last name, and first names that are equal, one a known nickname or the initial of the other, or a nickname quoted in a
     legal name of this report (aliases: last name -> {first name, nickname} pairs)."""
     (la, ga, na), (lb, gb, nb) = person_parts(a), person_parts(b)
+    if la and lb and la != lb and ga and gb and ga[0] == gb[0] and len(ga[0]) > 1 and min(len(la), len(lb)) >= 5 and one_edit(la, lb):
+        return True                                    # one letter off in the last name, same full first name: a typo on a notice (Dhinakaran / Dhinkaran)
     if not la or la != lb or not ga or not gb:
         return False
     fa, fb = ga[0], gb[0]
@@ -302,6 +363,9 @@ def merge_people(fd: dict, facts: list[dict], texts: list[str]) -> None:
             people.append({**p, "names": collections.Counter(p["names"])})
             continue
         q["roles"] |= p["roles"]
+        for r, (d0, d1) in p.get("role_dates", {}).items():
+            e0 = q.setdefault("role_dates", {}).get(r, (d0, d1))
+            q["role_dates"][r] = (min(e0[0], d0), max(e0[1], d1))
         q["first"], q["last"], q["n"] = min(q["first"], p["first"]), max(q["last"], p["last"]), q["n"] + p["n"]
         q["names"].update(p["names"])
         q["name"] = q["names"].most_common(1)[0][0]
@@ -377,7 +441,7 @@ def run_relationships(filings: list[dict], out: Path, model: str, rerun: bool, n
 
 # ---------------------------------------------------------------------------------------------- 4. facts
 METRICS = ["trading_volume", "revenue", "revenue_run_rate", "valuation", "funding_round", "fund_transaction", "employees",
-           "customers_users", "debt", "legal_event", "regulatory_status", "product_business", "person_role", "investor_link", "other"]
+           "customers_users", "debt", "legal_event", "regulatory_status", "product_business", "person_role", "person_link", "investor_link", "other"]
 MONTHS = "January|February|March|April|May|June|July|August|September|October|November|December"
 DATE_HEAD = re.compile(rf"(?:as of|as at|at|through|ended|ending|period ended)\s+(?:{MONTHS})\s+\d{{1,2}},\s+\d{{4}}", re.I)
 TABLE_HEAD = re.compile(r"schedule of investments|restricted securit|portfolio of investments|statement of assets|"
@@ -436,14 +500,25 @@ facts: every other fact about TARGET (or its subsidiaries). One row per fact:
   else (a share-count or record date, a trust-account date, a rent-roll date), and never a lease expiry, maturity or option
   date unless the fact is that expiry or option. "" when no date is stated for the fact or it is unclear which date applies);
   value_text (one plain-English sentence, max 30 words, stating the fact with its date);
+  other_company (only for person_role, see above; "" for every other metric);
   evidence; confidence.
   legal_event = each lawsuit, ruling, injunction, appeal or regulator action involving TARGET, as a separate row.
   person_role = a person's role at TARGET (director, adviser, founder); value_text names the person as the text gives the
   name, in the paragraph or its [ctx] lines, e.g. "Jane Doe is Chairman of TARGET". A table of directorships lists one
   person's positions on several rows and names the person only on the first: the person is the name in the nearest
   row above whose first cell is a person's name (e.g. "Jane Doe, Ph.D. | Acme | Software | Director" above
-  "TARGET | Medical Services | Chairman" means Jane Doe is Chairman of TARGET). Never write "A person" or "an
-  individual" when a name is given; only when no name is given anywhere, say "An unnamed person". investor_link = an investor or fund manager
+  "TARGET | Medical Services | Chairman" means Jane Doe is Chairman of TARGET). A [person] line gives the person whose
+  biography the paragraph sits in (the nearest name above it, often far above in a bio with a list of board seats): use it
+  when the paragraph itself names nobody. Never write "A person" or "an individual" when a name is given; only when no name
+  is given anywhere, say "An unnamed person". The role must be one the text says the person holds or held AT TARGET: a bio
+  that lists TARGET only as a past employer ("previously at Lungpacer") gives "former employee of TARGET", never a title
+  the person held at another company. For person_role also fill other_company: every OTHER company the same paragraph or
+  its [ctx]/[person] lines says this person holds or held a position at, with the position, e.g. "TELA Bio, Inc.: Chairman
+  of the Board since April 2020; WhiteSwell Medical: director". In a filing, "our", "we", "the Company" and "our Board"
+  mean the filer ({filer}); a bio in the filer's proxy or prospectus means the person is a director, nominee or officer of
+  the filer: name the filer with that position. When the filing defines a short name differently for an earlier period
+  (e.g. "Centinel" meaning a predecessor LLC before a reorganization), use the entity the text means for the date of the
+  position, not the filer's current name. "" when the text gives no other company. person_link is not used. investor_link = an investor or fund manager
   named as backing or managing an investment in TARGET without amounts. valuation = a value of the WHOLE company
   (post-money, price per share of a round); a fund's position value belongs in holdings only.
 
@@ -480,12 +555,217 @@ FACTS_SCHEMA = {
                                "confidence": {"type": "integer"}}}},
             "facts": {"type": "array", "items": {
                 "type": "object", "additionalProperties": False,
-                "required": ["para_no", "metric", "value_number", "unit", "as_of_date", "value_text", "evidence", "confidence"],
+                "required": ["para_no", "metric", "value_number", "unit", "as_of_date", "value_text", "other_company", "evidence", "confidence"],
                 "properties": {"para_no": {"type": "integer"}, "metric": {"type": "string", "enum": METRICS},
                                "value_number": _NUM, "unit": {"type": "string", "enum": UNITS},
-                               "as_of_date": {"type": "string"}, "value_text": {"type": "string"},
+                               "as_of_date": {"type": "string"}, "value_text": {"type": "string"}, "other_company": {"type": "string"},
                                "evidence": {"type": "string"}, "confidence": {"type": "integer"}}}},
         }}}
+
+
+FACTS_VERSION = 5          # 3: person_link facts with other_company, [person] lines for bios
+KNOWN_PEOPLE: list = []    # Form D names of the company's people, set in main(): a bio heading above a list of board seats
+ROLE_WORDS = re.compile(r"\b(?:board|director|officer|chair(?:man|woman|person)?|founder|member|advis[eo]r|president|ceo|cfo|cto|partner|secretary)\b", re.I)
+NAME_LINE = re.compile(r"^(?:(?:Dr|Mr|Ms|Mrs)\.?\s+)?[A-Z][a-z'’-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z'’-]+){1,2}(?:,?\s+(?:Ph\.?D\.?|M\.?D\.?|Jr\.?))?$")
+
+
+def person_heading(scope, pid: int, back: int = 150) -> str:
+    """The person a bio paragraph is about: the nearest paragraph above that names one of the company's Form D people, else
+    the nearest short line that is just a person's name ('Lila Tretikov' heading a bio whose board list names TARGET)."""
+    if not ROLE_WORDS.search(scope.by_id[pid].text):
+        return ""
+    if any(d.has_word(scope.by_id[pid].text, n) for n in KNOWN_PEOPLE):
+        return ""                                      # the paragraph names the person itself
+    above = [(q, (scope.by_id[q].text if q in scope.by_id else "").strip()) for q in range(pid - 1, max(-1, pid - back), -1)]
+    for q, t in above:                                 # a known person first: a company or job line can look like a name
+        hit = next((n for n in KNOWN_PEOPLE if d.has_word(t, n)), None)
+        if hit:
+            return f"[person] the nearest person named above this paragraph (paragraph {q}): {hit}"
+    for q, t in above[:40]:
+        if len(t) <= 40 and NAME_LINE.match(t):
+            return f"[person] maybe the person (a short name-like line {pid - q} paragraphs above): {t}"
+    return ""
+
+
+PERSON_CHECK_SYSTEM = """You check one fact about a person, read by another model from an SEC filing, against the passage it came from.
+TARGET = {target}. The fact says what role the person has or had AT TARGET (value_text) and, in other_company, the person's
+positions at other companies ("Company: position; Company2: position").
+Decide whether the passage supports each part: the title or role, that it is AT TARGET, the dates, and each other company
+with its position. Watch for a title that the passage ties to another organisation (e.g. "Former Head Quality, Arbutus ...
+roles at various organizations including TARGET": the title is at Arbutus, at TARGET only an unnamed role), for TARGET named
+only as one of several past employers, and for a company name the passage uses for a different entity at that date.
+The passage is only a window of the filing: something it does not mention may be stated elsewhere. Change ONLY what the
+passage contradicts or attributes to another organisation; never drop a company or detail just because the passage is silent.
+Write a company name the way the passage writes it for that date (a short name like "Centinel" stays "Centinel" when the
+filing uses it for a predecessor; do not expand it to the filer's current legal name).
+Return supported (false only when something is contradicted or misattributed), value_text (corrected sentence, or unchanged),
+fix_other (list of {{company, position}} for other companies whose entry is wrong: the corrected name and position; empty
+when none), drop_other (names of other_company entries the passage shows are wrong and cannot be corrected; usually empty),
+reason (one sentence)."""
+PERSON_CHECK_SCHEMA = {"name": "person_check", "strict": True, "schema": {
+    "type": "object", "additionalProperties": False, "required": ["supported", "value_text", "fix_other", "drop_other", "reason"],
+    "properties": {"supported": {"type": "boolean"}, "value_text": {"type": "string"},
+                   "fix_other": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["was", "company", "position"],
+                                 "properties": {"was": {"type": "string"}, "company": {"type": "string"}, "position": {"type": "string"}}}},
+                   "drop_other": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"}}}}
+PERSON_CHECK_VERSION = 2
+
+
+def passage_for(path: str, quote: str, width: int = 900) -> str:
+    """The text around a fact's quote in its filing (tags stripped), so the check sees what the quote sits in."""
+    try:
+        t = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return quote
+    t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ", t)))
+    t = re.sub(r"\s+", " ", t)
+    words = [w for w in re.findall(r"\w+", quote or "") if len(w) > 3][:8]
+    i = -1
+    for k in range(len(words), 1, -1):                 # the longest run of the quote's first words that is in the text
+        m = re.search(r"\W+".join(map(re.escape, words[:k])), t, re.I)
+        if m:
+            i = m.start()
+            break
+    return t[max(0, i - width): i + len(quote or "") + width] if i >= 0 else quote
+
+
+def check_person_facts(facts: list, filings: list, target: str, out: Path, model: str, no_llm: bool) -> int:
+    """Second look at every person_role fact: a narrow question to the model with the passage around the quote. A fact the
+    passage does not support is corrected (value_text, other_company) and marked in check_note. Cached in person_checks.json."""
+    if no_llm:
+        return 0
+    cache_p = out / "person_checks.json"
+    cache = json.loads(cache_p.read_text(encoding="utf-8")) if cache_p.exists() else {}
+    paths = {m.get("sec_url"): m.get("pdf") for m in filings}
+    import hashlib
+    fixed = 0
+    for f in facts:
+        if f.get("metric") not in ("person_role", "person_link"):
+            continue
+        key = hashlib.sha1(json.dumps([PERSON_CHECK_VERSION, f.get("value_text"), f.get("other_company"), f.get("evidence"), f.get("sec_url")]).encode()).hexdigest()
+        if key not in cache:
+            passage = passage_for(paths.get(f.get("sec_url")) or "", f.get("evidence") or "")
+            res = c.call_llm(json.dumps({"value_text": f.get("value_text", ""), "other_company": f.get("other_company", ""),
+                                         "quote": f.get("evidence", ""), "passage": passage}), model, max_tokens=800, timeout=120,
+                             label="person check", system=PERSON_CHECK_SYSTEM.format(target=target), schema=PERSON_CHECK_SCHEMA)
+            try:
+                cache[key] = json.loads(res.content)
+            except ValueError:
+                cache[key] = {"supported": True, "reason": "check failed: " + (res.error or "no answer")}
+        v = cache[key]
+        if not v.get("supported", True):              # only contradicted parts change: entries the passage is silent on are kept
+            entries = [x for x in re.split(r";\s*(?=[^;]+:)", f.get("other_company") or "") if x.strip()]
+            fixes = {norm_name(x.get("was") or x.get("company") or ""): x for x in v.get("fix_other") or []}
+            drop = {norm_name(x) for x in v.get("drop_other") or []}
+            kept = []
+            for e in entries:
+                comp = norm_name(e.partition(":")[0])
+                if comp in drop:
+                    continue
+                x = fixes.get(comp)
+                kept.append(f"{x['company']}: {x['position']}" if x else e)
+            f["check_note"] = f"corrected by the person check: {v.get('reason', '')} (was: {f.get('value_text', '')} | {f.get('other_company', '')})"
+            f["value_text"], f["other_company"] = v.get("value_text") or f["value_text"], "; ".join(kept)
+            fixed += 1
+        fixed += rule_fixes(f, passage_for(paths.get(f.get("sec_url")) or "", f.get("evidence") or ""), target)
+    cache_p.write_text(json.dumps(cache, indent=1), encoding="utf-8")
+    return fixed
+
+
+def rule_fixes(f: dict, passage: str, target: str) -> int:
+    """Two fixed rules after the model's check. (1) The passage names TARGET only inside a list of employers ("roles at various
+    organizations including TARGET, INEX, Lilly"): the fact keeps no title at TARGET. (2) Each other company is written as the
+    passage writes it ("Centinel", not the filer's later name), when the passage uses a shorter form."""
+    n = 0
+    short = re.escape(norm_name(target).split()[0]) if norm_name(target) else ""
+    flat = re.sub(r"\s+", " ", passage or "")
+    ev = re.sub(r"\s+", " ", f.get("evidence") or "")
+    in_list = short and re.search(rf"\b(?:including|such as)\s+(?:[A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*)*,\s+)*{short}\b(?:\s+\w+)?\s*(?:,|and\b)", ev, re.I)
+    if in_list:                                     # the sentence the list sits in, as the filing writes it
+        start = max(ev.rfind(".", 0, in_list.start()) + 1, 0)
+        cut = re.search(r"(?<=[a-z])\s+(?=Over\b|\d+\+?\s+years)", ev[start:in_list.start()])   # a flattened slide: drop the title block before the list sentence
+        start += cut.end() if cut else 0
+        stop = ev.find(".", in_list.end())
+        said = ev[start: stop if stop > 0 else len(ev)].strip()
+    if f.get("metric") == "person_role" and in_list:   # the quote itself names TARGET as one item of a list of employers
+        person = written_name(f)
+        new = f"{person}: the filing names the company only in a list, \"{said}\", and gives no title there."
+        if f.get("value_text") != new:
+            f["check_note"] = f"rule: the company is named only in a list of organizations; no title at it (was: {f.get('value_text', '')})"
+            f["value_text"] = new
+            n = 1
+    if flat and f.get("other_company"):
+        out = []
+        for e in re.split(r";\s*(?=[^;]+:)", f["other_company"]):
+            comp, sep, pos = e.partition(":")
+            full = LEGAL.sub("", comp.strip())
+            first = full.split()[0] if full.split() else ""
+            if full and first and len(first) > 3 and not re.search(re.escape(full), flat, re.I) and re.search(rf"\b{re.escape(first)}\b(?!\s+{re.escape(full.split()[1]) if len(full.split()) > 1 else 'x^'})", flat):
+                f["check_note"] = (f.get("check_note", "") + f" | rule: '{comp.strip()}' written as the filing writes it ('{first}')").strip(" |")
+                comp, n = first, 1
+            out.append(f"{comp.strip()}{sep}{pos}")
+        f["other_company"] = "; ".join(out)
+    return n
+
+
+def written_name(f: dict) -> str:
+    """The person's name as this filing writes it (the fact's own sentence), not the Form D spelling ('Doug', not 'Douglas')."""
+    m = PERSON_HEAD.match(f.get("value_text") or "")
+    return m[1] if m else (f.get("person") or "The person")
+
+
+def people_links_from(facts: list, name: str) -> list:
+    """A person at TARGET who also holds a position at another company (person_role facts with other_company): one row per other
+    company, relation shares_person_with. A people link, not a business relationship: never in the edges."""
+    people_links = []
+    for f in facts:
+        if f.get("metric") not in ("person_role", "person_link"):
+            continue
+        for part in re.split(r";\s*(?=[^;]+:)", f.get("other_company") or ""):
+            comp, _, pos = part.partition(":")
+            comp = comp.strip(" .")
+            if not comp or norm_name(comp) == norm_name(name):
+                continue
+            people_links.append({"form": f.get("form", ""), "filing_date": f.get("filing_date", ""), "filer": f.get("filer", ""), "page": f.get("page", ""),
+                                 "from_company": comp, "relation": "shares_person_with", "to_company": name,
+                                 "role_sentence": f"{written_name(f)}: {pos.strip() or 'position not stated'} at {comp}.",   # its own text, not the fact's sentence
+                                 "direction_check": "people link: a person's positions, not a business relationship (not in the edges)",
+                                 "confidence": f.get("confidence", ""), "evidence_quote": f.get("evidence", ""), "sec_url": f.get("sec_url", "")})
+    seen, uniq = set(), []                            # one row per person and other company, however many facts repeat it
+    for x in people_links:
+        k = (norm_name(x["from_company"]), norm_name(x["role_sentence"].split(":")[0]))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(x)
+    return uniq
+
+
+def profile_facts(fd: dict, name: str, cik: str) -> list:
+    """Company profile from the company's own Form D notices: incorporation, each address with the notices that give it, industry."""
+    out, rows = [], fd.get("profile") or []
+    url = lambda r: f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{r['accession_number'].replace('-', '')}/"   # noqa: E731
+
+    def add(r, metric_text, ev, first, last):
+        out.append({"as_of_date": str(first)[:10], "metric": "company_profile", "value_number": "", "unit": "none", "value_text": metric_text,
+                    "form": "D", "filer": name, "filing_date": str(last)[:10], "sources": "", "page": "", "evidence": ev, "confidence": 100,
+                    "sec_url": url(r), "person": "", "other_company": ""})
+    groups: dict = {}
+    for r in rows:
+        yi = str(r.get("year_of_inc") or "")
+        inc = (r.get("jurisdiction_of_inc") or "") + (f" in {yi}" if yi.isdigit() else f", {yi} before this notice" if yi else "")
+        for kind, val in (("incorporation", inc if r.get("jurisdiction_of_inc") else ""),
+                          ("address", ", ".join(str(r[k]) for k in ("street1", "street2", "city", "state") if r.get(k))),
+                          ("industry", r.get("industry") or "")):
+            if val:
+                g = groups.setdefault((kind, val.upper()), {"r": r, "val": val, "first": r["filing_date"], "last": r["filing_date"]})
+                g["first"], g["last"] = min(g["first"], r["filing_date"]), max(g["last"], r["filing_date"])
+    for (kind, _), g in groups.items():
+        span = f"{str(g['first'])[:10]}" + (f" to {str(g['last'])[:10]}" if g["last"] != g["first"] else "")
+        text = {"incorporation": f"Form D: incorporated in {g['val'].title() if g['val'].isupper() else g['val']} (notices {span}).",
+                "address": f"Form D issuer address {g['val']} (notices {span}).",
+                "industry": f"Form D industry group: {g['val']}."}[kind]
+        add(g["r"], text, f"Form D {kind}: {g['val']}", g["first"], g["first"])   # date and link of the same (first) notice; the text gives the span
+    return out
 
 
 def parse_facts(content: str) -> tuple[dict, bool]:
@@ -613,7 +893,9 @@ def extract_facts(m: dict, target: str, out: Path, model: str, refresh: bool, no
     if s.clean_form(m["form"]).startswith("N-CEN") and m["document"].lower().endswith(".xml"):
         return ncen_facts(m, target)
     if cache.exists() and not refresh:
-        return json.loads(cache.read_text(encoding="utf-8"))
+        got = json.loads(cache.read_text(encoding="utf-8"))
+        if got.get("meta", {}).get("schema", 0) >= FACTS_VERSION:   # an answer to an older prompt is asked again
+            return got
     if no_llm:
         return {"holdings": [], "facts": [], "meta": {"status": "skipped (--no-llm)"}}
     scope = s.load_scope(m["pdf"], m["mentions_csv"], m["filer"])
@@ -634,7 +916,8 @@ def extract_facts(m: dict, target: str, out: Path, model: str, refresh: bool, no
         dates = date_headings(scope, pid) if table else ""
         units = unit_headings(scope, pid) if table else ""
         sched = schedule_heading(scope, pid) if table else ""
-        blocks.append((pid, "\n".join(x for x in (dates, units, sched, before, p.line(), after) if x)))
+        who = person_heading(scope, pid)
+        blocks.append((pid, "\n".join(x for x in (dates, units, sched, who, before, p.line(), after) if x)))
     chunks, cur, used = [], [], 0
     for pid, b in blocks:
         t = c.est_tokens(b)
@@ -646,7 +929,7 @@ def extract_facts(m: dict, target: str, out: Path, model: str, refresh: bool, no
     if cur:
         chunks.append(cur)
     filing = s.filing_context(m["form"], m["file_date"], m["filer"], False)
-    system = FACTS_SYSTEM.format(target=target, filing=filing, metrics=", ".join(METRICS), units=", ".join(UNITS))
+    system = FACTS_SYSTEM.format(target=target, filing=filing, metrics=", ".join(METRICS), units=", ".join(UNITS), filer=m["filer"])
     holdings, facts, cost, calls = [], [], 0.0, 0
     all_complete = True
     for i, ch in enumerate(chunks):
@@ -688,7 +971,7 @@ def extract_facts(m: dict, target: str, out: Path, model: str, refresh: bool, no
               f"{len(got['facts'])} facts, ${res.cost:.4f}{'' if complete else '  <-- INCOMPLETE ' + res.error}", flush=True)
     data = {"holdings": holdings, "facts": facts,
             "meta": {"paragraphs": len(pids), "unique_paragraphs": len(blocks), "calls": calls, "cost_usd": round(cost, 4),
-                     "target_found": bool(tid), "model": model, "schema": 2}}
+                     "target_found": bool(tid), "model": model, "schema": FACTS_VERSION}}
     if not all_complete:                       # a failed call must not be remembered as "nothing found"
         print(f"    facts {m['stem']}: incomplete, not cached", flush=True)
         return data
@@ -2070,7 +2353,7 @@ def build_html(a, fd: dict, filings: list[dict], holdings: list[dict], facts: li
 <div class="muted">FINANCIAL MODEL · UPDATED {today.strftime('%m/%d/%Y')}</div>
 <h1>{esc(short)}: financials year by year, {first_year}-{fyears[-1]}</h1><br>
 <h3>SCOPE</h3><p>Funding, ownership, valuation marks, relationships and legal record of {esc(name)} (SEC CIK {esc(co['cik'])}{formerly}) for
-every year from incorporation in {first_year} to {last_hist}, plus the frame for {fyears[0]}-{fyears[-1]} forecasts. Built from the SEC
+every year from {"incorporation in " if fd["year_of_inc"] else ""}{first_year} to {last_hist}, plus the frame for {fyears[0]}-{fyears[-1]} forecasts. Built from the SEC
 Form D database ({len(fd['filings'])} Form D filings by the company, {len(fd['spvs'])} SPVs) and {n_acc(others)} SEC filings by other companies and
 funds that name {esc(short)}{", plus Department of Labor Form 5500 benefit-plan filings" if plans else ""}. {"Revenue, staff, cost, credit and forecast figures are model estimates built from these records and labelled as such; figures that remain unknown" if fm else "Revenue, " + ("global " if plans else "") + "headcount, cost and forecast figures are not in these sources: they"} are shown as placeholders
 (<span class="ph">R1</span> ...) and the forms needed to fill each one are listed in the final sections.</p>
@@ -2094,7 +2377,7 @@ language model (GPT-4.1); every row keeps a verbatim quote that was checked agai
     sold_years = sorted(sale_year(o) for o in offs if float(o["total_amount_sold"] or 0) > 0)   # first to last sale, not to the latest filing
     span = (f"{sold_years[0]}-{sold_years[-1]}" if sold_years[0] != sold_years[-1] else f"in {sold_years[0]}") if sold_years else "no sale reported"
     w(f"""<h2>{esc(short)} raised {money(total_raised)} in {n_sold} Form D offerings, {span}</h2>
-<p><b>TL;DR:</b> {esc(name)}{" (" + formerly[2:] + ")" if prev else ""}, incorporated in {esc(co['jurisdiction_of_inc'] or '').title()} in {first_year} and based in
+<p><b>TL;DR:</b> {esc(name)}{" (" + formerly[2:] + ")" if prev else ""}, incorporated in {esc(co['jurisdiction_of_inc'] or '').title()} {f"in {first_year}" if fd["year_of_inc"] else "(year not stated" + (f"; Form D says {esc(fd['inc_note'])} before the notice" if fd.get("inc_note") else "") + f"; first Form D sale {first_year})"} and based in
 {esc((co['city'] or '').title())}, {esc(co['state'] or '')}, has filed {len(fd['filings'])} Form D notices. They report
 {money(total_raised)} of {'equity and debt' if any_debt else 'equity'} sold in {n_sold} offerings{no_sale}, with {int(co['total_investors'] or 0)} investor participations
 (each notice's investor count added up: an investor in several rounds is counted once per round),
@@ -2152,19 +2435,30 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
         for o in offs:
             if sale_year(o) != y:
                 continue
-            late = (as_date(o["filing_date"]) - (as_date(o["sale_date"]) or as_date(o["filing_date"]))).days
+            late = (as_date(o.get("first_filed") or o["filing_date"]) - (as_date(o["sale_date"]) or as_date(o["filing_date"]))).days
             kind = ", ".join(k for k, f in (("equity", o["is_equity"]), ("debt", o["is_debt"]), ("options/warrants", o["is_option_to_acquire"]),
-                                             ("business combination", o["is_business_combination"])) if f) or "type not stated"
+                                             ("business combination", o["is_business_combination"])) if f) or (o.get("other_type_desc") or "type not stated")
+            if o.get("other_type_desc") and o["other_type_desc"].lower() not in kind.lower():
+                kind = f"{kind} ({o['other_type_desc']})" if kind != o["other_type_desc"] else kind
             sold = float(o["total_amount_sold"] or 0)
             items.append(f"{fmt_date(o['sale_date'])}: {'first sale of ' if sold else ''}{'an' if kind[0] in 'aeiou' else 'a'} {kind} {'offering' if sold else 'notice, no sale reported'}; "
                          f"{money(o['total_amount_sold'])} sold of {money(o['total_offering_amount'])} offered; {int(o['total_investors'] or 0)} investor(s) on this notice "
-                         f"(Form {esc(o['submission_type'])} filed {fmt_date(o['filing_date'])}"
-                         f"{f', {late // 365} year(s) after the sale' if late > 365 else ''})"
+                         f"(Form D first filed {fmt_date(o.get('first_filed') or o['filing_date'])}"
+                         + (f"; numbers from Form {esc(o['submission_type'])} filed {fmt_date(o['filing_date'])}" if o.get("first_filed") and o["first_filed"] != o["filing_date"] else "")
+                         + f"{f', {late // 365} year(s) after the sale' if late > 365 else ''})"
                          + (f". Note: {esc(o['sales_amt_clarification'])}" if o["sales_amt_clarification"] else ""))
-        for p in fd["people"]:
-            if as_date(p["first"]).year == y:
-                items.append(f"Form D lists {esc(p['name'])} as {esc(' and '.join(sorted(p['roles'])).lower())} for the first time "
-                             f"(filed {fmt_date(p['first'])})")
+        for p in fd["people"]:                         # roles as the notices of that year state them, not every role the person ever had
+            rd = p.get("role_dates") or {r: (p["first"], p["last"]) for r in p["roles"]}
+            by_day = collections.defaultdict(list)    # one line per notice: a D/A in January and a new D in April are two events
+            for r, (d0, _) in rd.items():
+                if as_date(d0).year == y:
+                    by_day[d0].append(r)
+            for d0, new in sorted(by_day.items()):
+                if d0 == p["first"]:
+                    items.append(f"Form D lists {esc(p['name'])} as {esc(' and '.join(sorted(new)).lower())} for the first time (filed {fmt_date(d0)})")
+                else:
+                    items.append(f"Form D first lists {esc(p['name'])} as {esc(' and '.join(sorted(new)).lower())} (filed {fmt_date(d0)}; named on Form D since "
+                                 f"{fmt_date(p['first'])})")
         sp = [x for x in fd["spvs"] if as_date(x["first_filing"]).year == y]
         if sp:
             items.append(f"{len(sp)} SPV(s) set up to buy {esc(short)} shares filed Form D: {money(sum(float(x['total_raised'] or 0) for x in sp))} "
@@ -2304,7 +2598,7 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
     for p in fd["people"]:
         also = "; ".join(n for n in p["names"] if n != p["name"])   # other spellings: on Form D or in other filings
         also = f" <span class='muted'>(also named {esc(also)})</span>" if also else ""
-        w(f"<tr><td>{esc(p['name'])}{also}</td><td>{esc(', '.join(sorted(p['roles'])))}</td><td>{fmt_date(p['first'])}</td>"
+        w(f"<tr><td>{esc(p['name'])}{also}</td><td>{esc(role_text(p))}</td><td>{fmt_date(p['first'])}</td>"
           f"<td>{fmt_date(p['last'])}</td><td class='n'>{p['n']}</td></tr>")
     w("</table>")
     if fd["spvs"]:
@@ -2314,6 +2608,9 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
               f"<td class='n'>{int(x['total_investors'] or 0)}</td></tr>")
         w(f"<tr><td><b>Total</b></td><td></td><td class='n'><b>{money(spv_total)}</b></td><td class='n'>{spv_inv}</td></tr></table>")
         w("<p class='note'>SPV money buys existing or new shares through the SPV; it may overlap with the company's own offerings.</p>")
+    if fd.get("spvs_left_out"):
+        w("<p class='note'>Left out as look-alikes (company-finder judged every mention in their Form D to be another organisation): "
+          + "; ".join(esc(x["company_name"]) for x in fd["spvs_left_out"]) + ".</p>")
     w('<h3>Fund holdings and valuation marks</h3>')
     if allh:
         w(f'<p class="note">Holdings from fund and lender filings: {len(holdings)} row(s) used, {len(allh) - len(holdings)} not verified.{ev_note}</p>')
@@ -2398,7 +2695,16 @@ the largest {money(co['largest_offering'])}{debt_split}; {'the revenue range was
               f"<td>{esc('; '.join(f'{k} x{v}' for k, v in e['checks'].items()))}</td></tr>")
         w("</table>")
     else:
-        w("<p class='note'>No relationship rows (run without --no-llm).</p>")
+        w("<p class='note'>No company-to-company relationship is stated in the filings read.</p>")
+    plinks = people_links_from(facts, name)
+    if plinks:
+        w(f'<h3>People links ({len(plinks)})</h3><p class="note">A person who holds or held a position at {esc(short)} and also at another '
+          'company, as the filings state. These are links through people, not business relationships between the companies.</p>'
+          '<table><tr><th>Other company</th><th>What the filing says</th><th>Filing</th></tr>')
+        for x in plinks:
+            w(f"<tr><td>{esc(x['from_company'])}</td><td>{esc(x['role_sentence'])}</td><td><a href='{esc(x['sec_url'])}'>{esc(x['form'])}</a> "
+              f"{fmt_date(x['filing_date'])}</td></tr>")
+        w("</table>")
     roles = [f for f in facts if f["metric"] in ("person_role", "investor_link")]
     if roles:
         w('<h3>People and investors named in other filings</h3><p class="note">One person under several spellings (nickname, initial, '
@@ -2538,10 +2844,12 @@ def main() -> int:
     a.cfg = json.loads(Path(a.model_config).read_text(encoding="utf-8")) if a.model_config else {}
     a.short = short_name(name, a.cfg)
     spv_key = a.spv_key or (a.cfg.get("company") or {}).get("spv_key") or norm_name(name).split()[0]
-    fd = load_formd(Path(a.formd_db), cik, spv_key)
+    from finder_verdicts import lookalikes
+    fd = load_formd(Path(a.formd_db), cik, spv_key, lookalikes([a.company, *(a.extra_folder or [])]))
+    KNOWN_PEOPLE[:] = sorted({n for p in fd["people"] for n in p["names"] if len(n.split()) >= 2}, key=len, reverse=True)
     fd["previous_names"] = previous_names(a.formd_xml_dir, cik)
     print(f"   {name}: {len(fd['filings'])} filings, {len(fd['offerings'])} offerings, {money(fd['company']['total_raised'])} sold, "
-          f"{len(fd['people'])} people, {len(fd['spvs'])} SPVs ('{spv_key}'), former names: {'; '.join(fd['previous_names']) or 'none given'}")
+          f"{len(fd['people'])} people, {len(fd['spvs'])} SPVs ('{spv_key}'; {len(fd['spvs_left_out'])} look-alike funds left out), former names: {'; '.join(fd['previous_names']) or 'none given'}")
 
     print("2. Filings that mention the company (prepared pipeline output)")
     only = set(Path(a.only_stems).read_text().split()) if a.only_stems else None
@@ -2570,6 +2878,7 @@ def main() -> int:
     holdings, facts = merge(filings, per_filing, a.evidence, a.tiers, name, add_unread=only is None, nport=a.nport)
     a.unread = merge.unread
     merge_people(fd, facts, merge.texts)
+    print(f"   {check_person_facts(facts, filings, name, out, a.model, a.no_llm)} person facts corrected by the second check")
     print(f"   {mark_restated_costs(holdings, name)} restated cost basis rows (not purchases); holders: "
           f"{dict(collections.Counter(h.get('holder_basis') or '' for h in holdings))}")
     if a.unread[0]:
@@ -2599,6 +2908,7 @@ def main() -> int:
     html_path = out / f"{stem}.html"
     html_path.write_text(doc, encoding="utf-8")
     write_csv(out / "formd_offerings.csv", fd["offerings"], list(fd["offerings"][0].keys()) if fd["offerings"] else [])
+    write_csv(out / "formd_notices_all.csv", fd["filings"], list(fd["filings"][0].keys()) if fd["filings"] else [])   # every notice, amendments included
     write_csv(out / "holdings.csv", holdings, ["holder", "vehicle", "position_type", "security", "verified", "source", "shares", "cost_usd", "fair_value_usd",
                                                 "commitment_usd", "shared_with", "value_scale", "shares_scale", "price_per_share",
                                                 "cost_per_share", "pct_net_assets", "acquisition_date", "as_of_date", "form", "filer",
@@ -2607,9 +2917,10 @@ def main() -> int:
                                                 "holder_basis", "holder_names", "reprinted_by", "cost_note", "per_share_note"])
     if a.nport:
         write_csv(out / "nport_holdings.csv", a.nport, [k for k in a.nport[0] if k not in ("date", "value", "filed", "q", "fund")])
-    write_csv(out / "facts.csv", facts, ["as_of_date", "metric", "value_number", "unit", "value_text", "form", "filer", "filing_date",
-                                          "sources", "page", "evidence", "confidence", "sec_url", "person"])
-    write_csv(out / "relationships_all.csv", rels, ["form", "filing_date", "filer", "page", "from_company", "relation", "to_company",
+    write_csv(out / "facts.csv", facts + profile_facts(fd, name, cik), ["as_of_date", "metric", "value_number", "unit", "value_text", "form", "filer", "filing_date",
+                                          "sources", "page", "evidence", "confidence", "sec_url", "person", "other_company", "check_note"])
+    people_links = people_links_from(facts, name)
+    write_csv(out / "relationships_all.csv", rels + people_links, ["form", "filing_date", "filer", "page", "from_company", "relation", "to_company",
                                                     "role_sentence", "direction_check", "confidence", "evidence_quote", "sec_url"])
     write_csv(out / "requirements.csv", [{"id": r, "missing_value": REQUIREMENTS[r][0], "required_form": REQUIREMENTS[r][1],
                                           "where": REQUIREMENTS[r][2], "unlocks": REQUIREMENTS[r][3]} for r in used],

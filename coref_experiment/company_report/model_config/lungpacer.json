@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-02",
+ "as_of": "2026-11-09",
  "fy_end_month": 12,
  "health_plan": "501",
  "k401_plan": "001",
@@ -13,6 +13,8 @@
    "AeroPace"
   ],
   "employee_company": "Lungpacer Medical",
-  "spv_key": "lungpacer"
+  "spv_key": "lungpacer",
+  "legal_name": "Lungpacer Medical, Inc.",
+  "description": "Privately held, venture-backed medical device company in Exton, Pennsylvania (incorporated in British Columbia, Canada) that makes the AeroPace System, a temporary transvenous diaphragm neurostimulation device to help patients wean off mechanical ventilators."
  }
 }

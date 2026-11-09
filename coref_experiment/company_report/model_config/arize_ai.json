@@ -1,0 +1,18 @@
+{
+ "as_of": "2026-11-09",
+ "fy_end_month": 12,
+ "name": "Arize AI",
+ "company": {
+  "cik": "0001803829",
+  "legal_name": "Arize AI, Inc.",
+  "match": "ARIZE AI",
+  "name_regex": "\\barize\\b(?:\\s?ai)?",
+  "aliases": [
+   "Arize AI",
+   "Arize AI, Inc."
+  ],
+  "description": "Venture-backed AI software company in Mill Valley, California (Delaware corporation, founded 2020) that makes an AI observability and LLM evaluation platform for machine-learning models; acquired by Dynatrace in October 2026.",
+  "employee_company": "Arize AI",
+  "spv_key": "arize"
+ }
+}

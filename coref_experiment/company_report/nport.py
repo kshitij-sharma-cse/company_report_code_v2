@@ -70,14 +70,22 @@ def cmd_list(a):
     print("search terms:", terms, file=sys.stderr)
     sec_setup()
     dump = Path(a.dump); dump.mkdir(parents=True, exist_ok=True)
-    seen = {}
+    seen, failed = {}, []
     for term, form in ((t, f) for t in terms for f in FORMS):
         before = len(seen)
         for s, e in windows():
             frm, total = 0, 1
             while frm < total and frm < 10000:
                 q = urllib.parse.urlencode({"q": f'"{term}"', "forms": form, "startdt": s, "enddt": e, "from": frm}, safe="/")
-                h = json.loads(get(f"https://efts.sec.gov/LATEST/search-index?{q}"))["hits"]
+                for i in range(4):                     # EFTS sometimes answers with an error body instead of hits
+                    body = json.loads(get(f"https://efts.sec.gov/LATEST/search-index?{q}"))
+                    if "hits" in body:
+                        break
+                    time.sleep(5 * (i + 1))
+                else:
+                    failed.append({"term": term, "form": form, "start": str(s), "end": str(e), "from": frm, "answer": str(body)[:200]})
+                    break
+                h = body["hits"]
                 total = h["total"]["value"]
                 for x in h["hits"]:
                     adsh, doc = x["_id"].split(":", 1)
@@ -96,12 +104,16 @@ def cmd_list(a):
             if total >= 10000:
                 print("window over 10,000 hits, list is cut:", term, form, s, e)
         print(f"{term!r} {form}: {len(seen) - before} new filings, {len(seen)} in all", flush=True)
-    if not seen:
-        sys.exit(f"list: 0 filings for {terms}")
     rows = sorted(seen.values(), key=lambda r: r["file_date"])
-    with open(dump / "manifest.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, list(rows[0].keys())); w.writeheader(); w.writerows(rows)
-    print(len(rows), "filings")
+    with open(dump / "manifest.csv", "w", newline="") as f:      # written even with 0 filings: a company no fund holds is a result
+        w = csv.DictWriter(f, LIST_COLS); w.writeheader(); w.writerows(rows)
+    (dump / "list_failed.json").write_text(json.dumps(failed, indent=1))
+    print(len(rows), "filings" + ("" if rows else f" for {terms} (no N-PORT filing names the company)"))
+    if failed:
+        sys.exit(f"list: {len(failed)} search window(s) failed after retries, the list may be short; see {dump / 'list_failed.json'}")
+
+
+LIST_COLS = ["accession", "document", "form", "file_date", "period", "cik", "filer", "hit_in_primary", "search_terms"]
 
 
 def sec_url(r): return f"https://www.sec.gov/Archives/edgar/data/{r['cik']}/{r['accession'].replace('-', '')}/{r['document']}"
@@ -338,10 +350,12 @@ def cmd_export_db(a):
                            [pat] * (2 if a.match_title else 1)).fetchall()
     except duckdb.InvalidInputException as e:      # DuckDB uses RE2: no lookahead, lookbehind or backreference
         sys.exit(f"export-db: pattern {pat!r} is not RE2-compatible; company.name_regex must avoid lookarounds and backreferences ({e})")
-    if not rows:                                   # an empty file would only show up later as a report without N-PORT
-        sys.exit(f"export-db: 0 holdings whose issuer name matches {pat!r}; check company.name_regex or pass --config")
     with open(dump / "duckdb_rows.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f); w.writerow(DB_COLS); w.writerows(rows)
+    if not rows:                                   # written anyway (header only) so `build` runs, but said loudly
+        print(f"export-db: 0 holdings whose issuer name matches {pat!r}: no fund in the team database holds the company "
+              "under this name (if that is unexpected, check company.name_regex)")
+        return
     print(len(rows), "rows; pattern", pat, "; issuer names:", collections.Counter(r[9] for r in rows).most_common(12))
 
 

@@ -38,6 +38,7 @@ ap.add_argument("--no-evidence", action="store_true", help="skip the rule-based 
 ap.add_argument("--workers", type=int, default=2, help="processes for evidence_tables.py")
 ap.add_argument("--folders", nargs="*", default=None, help="dump folders of the company (default: config dump_folders, else <co> and every <co>_<word> with a manifest)")
 ap.add_argument("--context-windows", default="", help="context-window workbook (tools/build_context_windows.py): also run evidence_recall.py and evidence_workbook.py")
+ap.add_argument("--snapshots", default="", help="keep the data each step starts from in DIR/<NN_step>/input with a manifest.csv (tools/snapshot.py)")
 ap.add_argument("--companies-file", default="", help="company-finder input CSV, checked for a description (default: Targeted_pdf/*/input/<co>_input.csv, the file prepare_targeted.py reads)")
 args = ap.parse_args()
 co, dumps = args.company, Path(args.dumps)
@@ -119,6 +120,21 @@ for p, row in found:
 
 np_csv = dumps / f"{co}_nport" / "nport_holdings.csv"
 facts = HERE / "out" / co / "facts"
+SNAP = HERE.parents[1] / "tools" / "snapshot.py"
+
+
+def snapshot(step: str, paths: list, refs: tuple = (), note: str = "") -> None:
+    """Copy what a step is about to read into --snapshots/<step>/input (a clone on macOS); a failure is a warning, never a stop."""
+    if not args.snapshots:
+        return
+    argv = [sys.executable, str(SNAP), str(Path(args.snapshots) / step), *map(str, paths), *[x for r in refs for x in ("--ref", str(r))]]
+    if subprocess.run(argv + (["--note", note] if note else [])).returncode:
+        warn(f"snapshot {step}: failed")
+
+
+if not args.skip_inputs:
+    snapshot("03_input_tables", [cfg_path, np_csv.parent, args.formd_db, raw, facts], refs=(args.nport_db,),
+             note="build_inputs*.py: N-PORT loans and marks, Form D, government records -> inputs/<co>/data")
 steps = [("N-PORT loans", lambda: a.nport(args.nport_db, cfg, out)), ("N-PORT marks", lambda: a.marks(str(np_csv), cfg, out)), ("FPDS", lambda: a.fpds(raw, out)), ("USPTO", lambda: a.uspto(raw, out)),
          ("Form D", lambda: a.formd(raw, args.formd_db, cfg, out)), ("peers", lambda: a.peers(raw, cfg, out)), ("peer credit", lambda: c.peer_tables(raw, cfg, out)), ("lenders", lambda: b.lenders(raw, cfg, out)),
          ("S&P", lambda: b.sp_tables(raw, out)), ("H-1B", lambda: b.h1b(dumps / "raw_h1b", raw / "manifest.csv", cfg, out)), ("Form 5500", lambda: b.form5500(dumps / "employee_docs" / "raw", cfg, out)),
@@ -158,7 +174,9 @@ if not args.no_evidence:                          # numbers read by rule from th
     if not folders:
         missing.append("evidence: no dump folder with a manifest")
         print("MISSING", missing[-1], flush=True)
-    elif run("evidence tables", [str(HERE / "evidence_tables.py"), co, "--folders", *folders, "--workers", str(args.workers), "--dumps", str(dumps)]):
+    elif snapshot("04_evidence_tables", [cfg_path, *[dumps / f for f in folders], *[dumps / f"{f}_manifest.csv" for f in folders]],
+                  note="evidence_tables.py: every table row naming the company, read by rule from the filings") or run("evidence tables", [str(HERE / "evidence_tables.py"), co, "--folders", *folders, "--workers", str(args.workers), "--dumps", str(dumps)]):
+        snapshot("05_evidence_build", [cfg_path, ev], note="evidence_build.py: table rows -> positions with units, dates, tiers (evidence_rows.csv)")
         run("evidence build", [str(HERE / "evidence_build.py"), co])
 company = cfg.get("company", {})
 cmd = [sys.executable, str(HERE / "build_report.py"), co, "--cik", args.cik, "--name", args.name, "--formd-db", args.formd_db, "--model-config", str(cfg_path),
@@ -200,6 +218,9 @@ else:
 for flag, on in (("--no-llm", args.no_llm), ("--repair", args.repair)):
     if on:
         cmd.append(flag)
+snapshot("06_build_report", [cfg_path, *sorted(p for f in folders for p in (APP / "data" / "companies").glob(f"{f}__*")), ev_rows, np_csv,
+                             args.formd_db, out / "data", HERE / "out" / co / "facts", HERE / "out" / co / "relationships"],
+         note="build_report.py (AI relationships and facts, merge with evidence rows, report). " + " ".join(cmd[1:]))
 rc = subprocess.run(cmd).returncode
 if rc:
     missing.append(f"report: exit {rc}")
@@ -208,7 +229,7 @@ if args.context_windows:                          # recall check: every number o
         missing.append(f"recall: {args.context_windows} not found (tools/build_context_windows.py writes it)")
     elif not ev_rows.exists():
         missing.append("recall: no evidence rows (evidence steps skipped or failed)")
-    elif run("evidence recall", [str(HERE / "evidence_recall.py"), co, str(Path(args.context_windows).resolve())]):
+    elif snapshot("07_evidence_recall", [cfg_path, ev_rows, Path(args.context_windows)], note="evidence_recall.py and evidence_workbook.py") or run("evidence recall", [str(HERE / "evidence_recall.py"), co, str(Path(args.context_windows).resolve())]):
         run("evidence workbook", [str(HERE / "evidence_workbook.py"), co, cfg.get("name") or args.name, str(ev)])
 print("not built:", missing or "none", flush=True)
 for w in warnings:

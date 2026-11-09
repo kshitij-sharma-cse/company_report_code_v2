@@ -69,7 +69,8 @@ def parse(p: Path) -> dict | None:
     rels = []
     for rp in root.iter("relatedPersonInfo"):
         rs = [x.text.strip() for x in rp.iter("relationship") if x.text] + [None, None, None]
-        rels.append(dict(first_name=one(rp, "relatedPersonName/firstName"), last_name=one(rp, "relatedPersonName/lastName"),
+        rels.append(dict(first_name=one(rp, "relatedPersonName/firstName"), middle_name=one(rp, "relatedPersonName/middleName"),
+                         last_name=one(rp, "relatedPersonName/lastName"),
                          relationship_1=rs[0], relationship_2=rs[1], relationship_3=rs[2]))
     sale = od.find("typeOfFiling/dateOfFirstSale")
     return dict(
@@ -83,8 +84,10 @@ def parse(p: Path) -> dict | None:
         total_offering_amount=num(one(od, "offeringSalesAmounts/totalOfferingAmount")), total_amount_sold=num(one(od, "offeringSalesAmounts/totalAmountSold")),
         total_remaining=num(one(od, "offeringSalesAmounts/totalRemaining")), total_investors=num(one(od, "investors/totalNumberAlreadyInvested")),
         minimum_investment=num(one(od, "minimumInvestmentAccepted")), sales_amt_clarification=one(od, "offeringSalesAmounts/clarificationOfResponse"),
-        gross_proceeds_clarification=one(od, "useOfProceeds/clarificationOfResponse"), year_of_inc=one(iss, "yearOfInc/value"),
-        issuer_name=one(iss, "entityName"), city=one(iss, "issuerAddress/city"), state=one(iss, "issuerAddress/stateOrCountry"),
+        gross_proceeds_clarification=one(od, "useOfProceeds/clarificationOfResponse"), year_of_inc=one(iss, "yearOfInc/value") or ("over five years" if yes(iss, "yearOfInc/overFiveYears") else
+                                                    "yet to be formed" if yes(iss, "yearOfInc/yetToBeFormed") else None),
+        issuer_name=one(iss, "entityName"), street1=one(iss, "issuerAddress/street1"), street2=one(iss, "issuerAddress/street2"),
+        city=one(iss, "issuerAddress/city"), state=one(iss, "issuerAddress/stateOrCountry"),
         jurisdiction_of_inc=one(iss, "jurisdictionOfInc"), industry=one(od, "industryGroup/industryGroupType"), persons=rels)
 
 
@@ -148,8 +151,8 @@ def main() -> None:
     tmp.unlink(missing_ok=True)
     con = duckdb.connect(str(tmp))
     fd = pd.DataFrame(filings)
-    pp = pd.DataFrame(persons, columns=["accession_number", "first_name", "last_name", "relationship_1", "relationship_2", "relationship_3"])
-    con.execute("CREATE TABLE filings AS SELECT * EXCLUDE (industry) FROM fd")
+    pp = pd.DataFrame(persons, columns=["accession_number", "first_name", "middle_name", "last_name", "relationship_1", "relationship_2", "relationship_3"])
+    con.execute("CREATE TABLE filings AS SELECT * FROM fd")   # industry and street kept: the report's company profile reads them
     con.execute("CREATE TABLE related_persons AS SELECT * FROM pp")
     # one offering per file number (else the accession it amends, else its own); the latest notice states the totals
     con.execute("""CREATE TABLE offerings AS WITH k AS (SELECT *, coalesce(file_num, previous_accession_number, accession_number) AS okey FROM fd)
